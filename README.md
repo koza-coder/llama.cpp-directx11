@@ -1,4 +1,20 @@
-# llama.cpp
+# llama.cpp - DirectX 11 (D3D11) backend
+
+> **This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with a Direct3D 11 compute backend.**
+> It runs LLMs on Windows GPUs through their DirectX 11 driver, including older GPUs and GPUs without Vulkan, CUDA or
+> ROCm support.
+>
+> - **Download:** Windows x64 zips on the [releases page](https://github.com/koza-coder/llama.cpp-directx11/releases)
+> - **Tested** with Qwen2.5-0.5B Q4_0, perplexity 17.29 on both:
+>   - AMD Radeon AI PRO R9700: prompt 6910 tok/s, generation 95.6 tok/s
+>   - Moore Threads MTT S80: prompt 1244 tok/s, generation 17.6 tok/s
+> - **Backend source:** [ggml/src/ggml-d3d11](ggml/src/ggml-d3d11)
+> - **Other versions:** [DirectX 12](https://github.com/koza-coder/llama.cpp-directx12) (first choice on current GPUs,
+>   faster generation), [OpenGL](https://github.com/koza-coder/llama.cpp-opengl) - same llama.cpp, only the GPU
+>   backend differs
+>
+> Everything below is the upstream llama.cpp README.
+
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -73,6 +89,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [BLIS](docs/backend/BLIS.md) | All |
 | [CANN](docs/build.md#cann) | Ascend NPU |
 | [CUDA](docs/build.md#cuda) | Nvidia GPU |
+| [D3D11](ggml/src/ggml-d3d11) | Windows GPU |
 | [HIP](docs/build.md#hip) | AMD GPU |
 | [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
 | [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
