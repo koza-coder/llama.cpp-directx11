@@ -3,8 +3,8 @@
 // a chain of f32 ADDs whose operands are all views of one tensor with the same strides (the MoE expert sum):
 // dst = sum of n_src views, view k starting at element offs[k]
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint ne;

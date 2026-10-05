@@ -4,9 +4,9 @@
 // src0 {d_conv - 1 + n_t, d_inner, n_s}, src1 {d_conv, d_inner}, dst {d_inner, n_t, n_s}; one thread per dst element
 // FUSE_SILU: dst = silu(sum) (fused SSM_CONV + SILU)
 
-RWByteAddressBuffer src0 : register(u0);
-RWByteAddressBuffer src1 : register(u1);
-RWByteAddressBuffer dst  : register(u2);
+#define src0  UAV_SLOT(0)
+#define src1  UAV_SLOT(1)
+#define dst   UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_src0;

@@ -5,9 +5,9 @@
 //   weights[t][0..k) = their probs, divided by clamp(sum, clamp_min, clamp_max) with NORM
 // defines: NORM
 
-RWByteAddressBuffer logits  : register(u0);
-RWByteAddressBuffer ids     : register(u1);
-RWByteAddressBuffer weights : register(u2);
+#define logits   UAV_SLOT(0)
+#define ids      UAV_SLOT(1)
+#define weights  UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint  offset_logits;

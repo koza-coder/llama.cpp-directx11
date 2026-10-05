@@ -10,13 +10,13 @@
 // defines: DK, DV (head sizes, multiples of 4), K_F16, K_F32 or K_Q8_0, V_F16, V_F32 or V_Q8_0, K_ALIGNED, V_ALIGNED,
 //          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE, DECODE (see the second main)
 
-RWByteAddressBuffer q_buf : register(u0);
-RWByteAddressBuffer k_buf : register(u1);
-RWByteAddressBuffer v_buf : register(u2);
-RWByteAddressBuffer mask  : register(u3);
-RWByteAddressBuffer sinks : register(u4);
-RWByteAddressBuffer dst   : register(u5);
-RWByteAddressBuffer tmp   : register(u6);
+#define q_buf  UAV_SLOT(0)
+#define k_buf  UAV_SLOT(1)
+#define v_buf  UAV_SLOT(2)
+#define mask   UAV_SLOT(3)
+#define sinks  UAV_SLOT(4)
+#define dst    UAV_SLOT(5)
+#define tmp    UAV_SLOT(6)
 
 cbuffer Params : register(b0) {
     uint offset_q;
@@ -218,7 +218,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float slope = 1.0f;
     if (max_bias > 0.0f) {
         const float h = (float) i2;
-        slope = h < n_head_log2 ? pow(m0, h + 1.0f) : pow(m1, 2.0f * (h - n_head_log2) + 1.0f);
+        slope = h < n_head_log2 ? pow(abs(m0), h + 1.0f) : pow(abs(m1), 2.0f * (h - n_head_log2) + 1.0f);
     }
 #endif
 
@@ -338,7 +338,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         float slope = 1.0f;
         if (max_bias > 0.0f) {
             const float h = (float) i2;
-            slope = h < n_head_log2 ? pow(m0, h + 1.0f) : pow(m1, 2.0f * (h - n_head_log2) + 1.0f);
+            slope = h < n_head_log2 ? pow(abs(m0), h + 1.0f) : pow(abs(m1), 2.0f * (h - n_head_log2) + 1.0f);
         }
         mv = slope * f16tof32(mbits);
 #endif
@@ -354,7 +354,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
             d *= scale;
 #if defined(SOFTCAP)
+#if defined(GGML_D3D11)
+            d = logit_softcap * tanh(clamp(d, -9.010913f, 9.010913f));   // as in pass 1: tanh of a large input can give NaN
+#else
             d = logit_softcap * tanh(d);
+#endif
 #endif
             s = d + mv;
         }

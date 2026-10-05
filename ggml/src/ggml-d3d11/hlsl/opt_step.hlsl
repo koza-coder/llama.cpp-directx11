@@ -10,11 +10,11 @@
 // nothing has to be mapped back to the host. m and v are updated in place as well.
 // Every element is independent: one thread each. defines: ADAMW
 
-RWByteAddressBuffer w_buf : register(u0);   // weights, written in place
-RWByteAddressBuffer g_buf : register(u1);   // gradients
-RWByteAddressBuffer m_buf : register(u2);   // first moment  (ADAMW only, else bound to g)
-RWByteAddressBuffer v_buf : register(u3);   // second moment (ADAMW only, else bound to g)
-RWByteAddressBuffer p_buf : register(u4);   // 7 floats for AdamW, 2 for SGD
+#define w_buf  UAV_SLOT(0)   // weights, written in place
+#define g_buf  UAV_SLOT(1)   // gradients
+#define m_buf  UAV_SLOT(2)   // first moment  (ADAMW only, else bound to g)
+#define v_buf  UAV_SLOT(3)   // second moment (ADAMW only, else bound to g)
+#define p_buf  UAV_SLOT(4)   // 7 floats for AdamW, 2 for SGD
 
 cbuffer Params : register(b0) {
     uint offset_w;

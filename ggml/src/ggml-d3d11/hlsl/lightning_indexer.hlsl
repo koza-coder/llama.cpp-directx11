@@ -7,11 +7,11 @@
 // destination element is independent: one thread each. The mask is always f16, so this kernel
 // always needs USE_16BIT. defines: K_F16
 
-RWByteAddressBuffer q_buf : register(u0);   // {n_embd, n_head, n_tokens, n_stream}
-RWByteAddressBuffer k_buf : register(u1);   // {n_embd, *, n_kv, n_stream}
-RWByteAddressBuffer w_buf : register(u2);   // {n_head, n_tokens, *, n_stream}
-RWByteAddressBuffer m_buf : register(u3);   // {n_kv, n_tokens, *, n_stream or 1}, f16
-RWByteAddressBuffer dst   : register(u4);   // {n_kv, n_tokens, *, n_stream}
+#define q_buf  UAV_SLOT(0)   // {n_embd, n_head, n_tokens, n_stream}
+#define k_buf  UAV_SLOT(1)   // {n_embd, *, n_kv, n_stream}
+#define w_buf  UAV_SLOT(2)   // {n_head, n_tokens, *, n_stream}
+#define m_buf  UAV_SLOT(3)   // {n_kv, n_tokens, *, n_stream or 1}, f16
+#define dst    UAV_SLOT(4)   // {n_kv, n_tokens, *, n_stream}
 
 cbuffer Params : register(b0) {
     uint offset_q;

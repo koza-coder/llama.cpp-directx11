@@ -6,11 +6,11 @@
 // Without a comb matrix the mixing is the identity, so each stream just keeps its own residual.
 // One thread per destination element. defines: HAS_COMB
 
-RWByteAddressBuffer x_buf : register(u0);
-RWByteAddressBuffer r_buf : register(u1);   // residual
-RWByteAddressBuffer p_buf : register(u2);   // post
-RWByteAddressBuffer c_buf : register(u3);   // comb, bound to the residual when unused
-RWByteAddressBuffer dst   : register(u4);
+#define x_buf  UAV_SLOT(0)
+#define r_buf  UAV_SLOT(1)   // residual
+#define p_buf  UAV_SLOT(2)   // post
+#define c_buf  UAV_SLOT(3)   // comb, bound to the residual when unused
+#define dst    UAV_SLOT(4)
 
 cbuffer Params : register(b0) {
     uint offset_x;

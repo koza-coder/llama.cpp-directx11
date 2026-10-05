@@ -5,8 +5,8 @@
 // WIN_PART pads with zero where a window runs past the image; WIN_UNPART is the exact inverse and
 // never reads out of range, because the padded region is simply not visited.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

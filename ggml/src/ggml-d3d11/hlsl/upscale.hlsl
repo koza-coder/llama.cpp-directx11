@@ -3,8 +3,8 @@
 // UPSCALE (f32), nearest or bilinear (with or without align corners), following the CPU reference; one thread
 // per dst element, any strides. defines: BILINEAR
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint  offset_src;

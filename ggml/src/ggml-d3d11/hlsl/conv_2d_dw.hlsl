@@ -6,9 +6,9 @@
 // the source are skipped rather than treated as zero, which is the same thing here but matches
 // ggml_compute_forward_conv_2d_dw_whcn exactly.
 
-RWByteAddressBuffer knl : register(u0);
-RWByteAddressBuffer src : register(u1);
-RWByteAddressBuffer dst : register(u2);
+#define knl  UAV_SLOT(0)
+#define src  UAV_SLOT(1)
+#define dst  UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_knl;

@@ -2,9 +2,9 @@
 
 // CONCAT of two 4-byte tensors (f32 or i32, copied as raw bits) along dim; any strides
 
-RWByteAddressBuffer src0 : register(u0);
-RWByteAddressBuffer src1 : register(u1);
-RWByteAddressBuffer dst  : register(u2);
+#define src0  UAV_SLOT(0)
+#define src1  UAV_SLOT(1)
+#define dst   UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_src0;

@@ -5,8 +5,8 @@
 // which is NOT the order the switch in ops.cpp happens to list:
 //   0 UPPER_DIAG (i0 >= i1), 1 UPPER (i0 > i1), 2 LOWER_DIAG (i0 <= i1), 3 LOWER (i0 < i1)
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

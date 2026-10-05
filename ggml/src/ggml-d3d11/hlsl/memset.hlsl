@@ -8,7 +8,7 @@
 #define BYTES_PER_THREAD 16
 #endif
 
-RWByteAddressBuffer buf : register(u0);
+#define buf  UAV_SLOT(0)
 
 cbuffer Params : register(b0) {
     uint offset;   // in bytes

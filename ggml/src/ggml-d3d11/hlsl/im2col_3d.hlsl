@@ -4,8 +4,8 @@
 // element, following the CPU reference; taps outside the volume are 0. dst is contiguous.
 // defines: DST_F16 (with USE_16BIT)
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

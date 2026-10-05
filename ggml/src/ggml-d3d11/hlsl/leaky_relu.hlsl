@@ -2,8 +2,8 @@
 
 // LEAKY_RELU (f32): dst = x > 0 ? x : x * negative_slope, one workgroup per row
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint  offset_src;

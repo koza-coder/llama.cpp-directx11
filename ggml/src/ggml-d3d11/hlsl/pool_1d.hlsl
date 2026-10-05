@@ -4,8 +4,8 @@
 // AVG divides by the number of taps that actually landed inside the row, not by k, and MAX over an
 // entirely out-of-bounds window keeps -FLT_MAX. Both match ggml_compute_forward_pool_1d_ksp.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

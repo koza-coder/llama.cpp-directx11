@@ -3,8 +3,8 @@
 // TIMESTEP_EMBEDDING (f32): row i of dst holds cos/sin of src[i] scaled by a geometric frequency
 // ladder. half = dim / 2; an odd dim leaves the last column zero.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint  offset_src;

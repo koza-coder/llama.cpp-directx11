@@ -6,10 +6,10 @@
 //   dst = (softmax(logits) - labels) * grad[0] / n_rows
 // Everything but the scalar gradient is contiguous and the same shape as dst.
 
-RWByteAddressBuffer grad_buf : register(u0);
-RWByteAddressBuffer s0_buf   : register(u1);
-RWByteAddressBuffer s1_buf   : register(u2);
-RWByteAddressBuffer dst      : register(u3);
+#define grad_buf  UAV_SLOT(0)
+#define s0_buf    UAV_SLOT(1)
+#define s1_buf    UAV_SLOT(2)
+#define dst       UAV_SLOT(3)
 
 cbuffer Params : register(b0) {
     uint offset_grad;

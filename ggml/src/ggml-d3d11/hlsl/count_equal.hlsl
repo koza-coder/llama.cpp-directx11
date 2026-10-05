@@ -5,9 +5,9 @@
 // goes in the low word and the high word is cleared; the count cannot exceed the element count,
 // which the backend caps at UINT32_MAX.
 
-RWByteAddressBuffer src0 : register(u0);
-RWByteAddressBuffer src1 : register(u1);
-RWByteAddressBuffer dst  : register(u2);
+#define src0  UAV_SLOT(0)
+#define src1  UAV_SLOT(1)
+#define dst   UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_src0;

@@ -3,8 +3,8 @@
 // POOL_2D: one thread per dst element, following the CPU reference. Taps outside the plane are skipped, but the
 // average always divides by the full kernel area. dst is f32 and contiguous. defines: SRC_F16, POOL_MAX
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

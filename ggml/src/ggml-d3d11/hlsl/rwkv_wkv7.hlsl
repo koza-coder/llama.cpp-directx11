@@ -9,14 +9,14 @@
 // whole row - so one thread owns one (sequence, head, row i) and the token loop stays sequential
 // inside it. All tensors are contiguous; dst holds C*T outputs followed by the per-sequence states.
 
-RWByteAddressBuffer r_buf : register(u0);   // {head_size, HEADS, T}
-RWByteAddressBuffer w_buf : register(u1);
-RWByteAddressBuffer k_buf : register(u2);
-RWByteAddressBuffer v_buf : register(u3);
-RWByteAddressBuffer a_buf : register(u4);
-RWByteAddressBuffer b_buf : register(u5);
-RWByteAddressBuffer s_buf : register(u6);   // incoming state {head_size*C, n_seqs}
-RWByteAddressBuffer dst   : register(u7);
+#define r_buf  UAV_SLOT(0)   // {head_size, HEADS, T}
+#define w_buf  UAV_SLOT(1)
+#define k_buf  UAV_SLOT(2)
+#define v_buf  UAV_SLOT(3)
+#define a_buf  UAV_SLOT(4)
+#define b_buf  UAV_SLOT(5)
+#define s_buf  UAV_SLOT(6)   // incoming state {head_size*C, n_seqs}
+#define dst    UAV_SLOT(7)
 
 cbuffer Params : register(b0) {
     uint offset_r;

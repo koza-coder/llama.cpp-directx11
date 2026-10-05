@@ -2,8 +2,8 @@
 
 // REPEAT (f32): dst[i0, i1, i2, i3] = src[i0 % ne00, i1 % ne01, i2 % ne02, i3 % ne03], any strides
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

@@ -6,9 +6,9 @@
 // a second dispatch, so two threads never touch the same word. dst is contiguous; offsets and strides are in
 // blocks. defines: I64_IDX
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer idx : register(u1);
-RWByteAddressBuffer dst : register(u2);
+#define src  UAV_SLOT(0)
+#define idx  UAV_SLOT(1)
+#define dst  UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_src;

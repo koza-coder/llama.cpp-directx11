@@ -3,8 +3,8 @@
 // IM2COL (f32 input): [N, IC, IH, IW] => dst [N, OH, OW, IC*KH*KW], one thread per dst element, following the
 // CPU reference; out-of-image taps are 0. dst is contiguous. defines: DST_F16 (with USE_16BIT)
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

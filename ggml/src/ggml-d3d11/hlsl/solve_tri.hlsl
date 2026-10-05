@@ -5,9 +5,9 @@
 // thread owns one (batch, column) pair and keeps its own dependency chain. X is read back as it is
 // written, exactly as on the CPU.
 
-RWByteAddressBuffer srcA : register(u0);
-RWByteAddressBuffer srcB : register(u1);
-RWByteAddressBuffer dst  : register(u2);
+#define srcA  UAV_SLOT(0)
+#define srcB  UAV_SLOT(1)
+#define dst   UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_a;

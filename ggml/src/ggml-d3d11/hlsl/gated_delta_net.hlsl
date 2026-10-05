@@ -10,15 +10,15 @@
 // The states go to st (slot s at offset_st + s * st_slot_stride): the dst state area, or the recurrent cache
 // when the CPY that follows is fused (STATE_OUT: st is bound to the cache view; otherwise st is dst)
 
-RWByteAddressBuffer q_buf : register(u0);
-RWByteAddressBuffer k_buf : register(u1);
-RWByteAddressBuffer v_buf : register(u2);
-RWByteAddressBuffer g_buf : register(u3);
-RWByteAddressBuffer b_buf : register(u4);
-RWByteAddressBuffer s_buf : register(u5);
-RWByteAddressBuffer dst   : register(u6);
+#define q_buf  UAV_SLOT(0)
+#define k_buf  UAV_SLOT(1)
+#define v_buf  UAV_SLOT(2)
+#define g_buf  UAV_SLOT(3)
+#define b_buf  UAV_SLOT(4)
+#define s_buf  UAV_SLOT(5)
+#define dst    UAV_SLOT(6)
 #if defined(STATE_OUT)
-RWByteAddressBuffer st    : register(u7);
+#define st     UAV_SLOT(7)
 #else
 #define st dst
 #endif

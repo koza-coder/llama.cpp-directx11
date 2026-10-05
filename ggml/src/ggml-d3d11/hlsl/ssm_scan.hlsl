@@ -13,14 +13,14 @@
 // The first token reads the incoming state from src0 at ids[seq]; later tokens read back what this
 // same thread wrote into dst, which is what the CPU does when it sets s0 = s at the end of a token.
 
-RWByteAddressBuffer src_s0  : register(u0);   // s  {d_state, dim, n_head, n_seqs}
-RWByteAddressBuffer src_x   : register(u1);   // x  {dim, n_head, n_tokens, n_seqs}
-RWByteAddressBuffer src_dt  : register(u2);   // dt {n_head, n_tokens, n_seqs}
-RWByteAddressBuffer src_A   : register(u3);   // A  {d_state, n_head} or {1, n_head}
-RWByteAddressBuffer src_B   : register(u4);   // B  {d_state, n_group, n_tokens, n_seqs}
-RWByteAddressBuffer src_C   : register(u5);   // C  {d_state, n_group, n_tokens, n_seqs}
-RWByteAddressBuffer src_ids : register(u6);   // ids {n_seqs}, i32
-RWByteAddressBuffer dst     : register(u7);
+#define src_s0   UAV_SLOT(0)   // s  {d_state, dim, n_head, n_seqs}
+#define src_x    UAV_SLOT(1)   // x  {dim, n_head, n_tokens, n_seqs}
+#define src_dt   UAV_SLOT(2)   // dt {n_head, n_tokens, n_seqs}
+#define src_A    UAV_SLOT(3)   // A  {d_state, n_head} or {1, n_head}
+#define src_B    UAV_SLOT(4)   // B  {d_state, n_group, n_tokens, n_seqs}
+#define src_C    UAV_SLOT(5)   // C  {d_state, n_group, n_tokens, n_seqs}
+#define src_ids  UAV_SLOT(6)   // ids {n_seqs}, i32
+#define dst      UAV_SLOT(7)
 
 cbuffer Params : register(b0) {
     uint offset_s0;

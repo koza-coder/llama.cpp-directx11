@@ -31,11 +31,11 @@
 #define REG_N (TILE_N / TH_X)
 #define NTHREADS (TH_X * TH_Y)
 
-RWByteAddressBuffer src1 : register(u0);
-RWByteAddressBuffer src0 : register(u1);
-RWByteAddressBuffer dst  : register(u2);
+#define src1  UAV_SLOT(0)
+#define src0  UAV_SLOT(1)
+#define dst   UAV_SLOT(2)
 #if defined(MMID)
-RWByteAddressBuffer scratch : register(u3);
+#define scratch  UAV_SLOT(3)
 #endif
 
 cbuffer Params : register(b0) {

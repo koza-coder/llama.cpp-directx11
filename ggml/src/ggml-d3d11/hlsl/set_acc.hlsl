@@ -4,8 +4,8 @@
 // the view of dst described by (view_nb1, view_nb2, view_nb3, view_offset), all in elements.
 // With ACC defined the value is added instead of assigned. One workgroup per src1 row.
 
-RWByteAddressBuffer src1 : register(u0);
-RWByteAddressBuffer dst  : register(u1);
+#define src1  UAV_SLOT(0)
+#define dst   UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src1;

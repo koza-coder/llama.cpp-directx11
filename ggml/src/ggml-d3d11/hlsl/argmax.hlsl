@@ -4,8 +4,8 @@
 // Ties resolve to the LAST index, matching ggml_vec_argmax_f32, whose running-max compare fires
 // again on every element equal to the max.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

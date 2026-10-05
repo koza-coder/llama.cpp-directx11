@@ -11,8 +11,8 @@
 #define MAX_EXPERTS 1024
 #define COLS_PER_TILE 32
 
-RWByteAddressBuffer ids     : register(u0);
-RWByteAddressBuffer scratch : register(u1);
+#define ids      UAV_SLOT(0)
+#define scratch  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_ids;

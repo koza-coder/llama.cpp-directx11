@@ -7,8 +7,8 @@
 // destination element with no zeroing pass. nr0..nr3 are the repeat counts, integral by
 // construction (ggml_can_repeat). Both tensors have packed rows (nb0 == nb00 == 4).
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

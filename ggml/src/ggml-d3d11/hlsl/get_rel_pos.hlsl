@@ -3,8 +3,8 @@
 // GET_REL_POS (f16): dst[i2, i1, i0] = src[((ne1 - i1 - 1) + i2) * src_ne0 + i0].
 // Both sides are contiguous f16; this is the SAM relative position lookup.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

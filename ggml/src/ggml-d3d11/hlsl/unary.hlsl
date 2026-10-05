@@ -10,8 +10,8 @@
 #define STORE(buf, i, v) STORE_F32(buf, i, v)
 #endif
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint ne;
