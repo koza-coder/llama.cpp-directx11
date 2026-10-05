@@ -2,7 +2,7 @@
 
 // ARANGE (f32): dst[i] = start + step * i over a contiguous destination
 
-RWByteAddressBuffer dst : register(u0);
+#define dst  UAV_SLOT(0)
 
 cbuffer Params : register(b0) {
     uint  offset_dst;

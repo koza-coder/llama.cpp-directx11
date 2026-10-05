@@ -5,10 +5,10 @@
 // post_scale multiplies the result (1 unless a following SCALE is fused)
 // FUSE_MUL: dst *= wgt, with wgt broadcast over dims 1..3 like ggml_mul (fused RMS_NORM + MUL)
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 #if defined(FUSE_MUL)
-RWByteAddressBuffer wgt : register(u2);
+#define wgt  UAV_SLOT(2)
 #endif
 
 cbuffer Params : register(b0) {

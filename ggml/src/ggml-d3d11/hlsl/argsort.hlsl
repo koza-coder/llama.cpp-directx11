@@ -5,8 +5,8 @@
 // Ties keep the smaller source index first, which matches the CPU reference for distinct values.
 // defines: SORT_DESC (TOP_K always sorts descending)
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

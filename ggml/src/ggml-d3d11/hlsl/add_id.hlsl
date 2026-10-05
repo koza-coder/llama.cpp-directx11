@@ -2,10 +2,10 @@
 
 // ADD_ID (f32): dst[i0, i1, i2] = src0[i0, i1, i2] + src1[i0, ids[i1, i2]]
 
-RWByteAddressBuffer src0 : register(u0);
-RWByteAddressBuffer src1 : register(u1);
-RWByteAddressBuffer ids  : register(u2);
-RWByteAddressBuffer dst  : register(u3);
+#define src0  UAV_SLOT(0)
+#define src1  UAV_SLOT(1)
+#define ids   UAV_SLOT(2)
+#define dst   UAV_SLOT(3)
 
 cbuffer Params : register(b0) {
     uint offset_src0;

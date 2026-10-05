@@ -2,10 +2,10 @@
 
 // one workgroup per row; defines: HAS_MASK with MASK_F32 or MASK_F16, HAS_SINK
 
-RWByteAddressBuffer src   : register(u0);
-RWByteAddressBuffer mask  : register(u1);
-RWByteAddressBuffer sinks : register(u2);
-RWByteAddressBuffer dst   : register(u3);
+#define src    UAV_SLOT(0)
+#define mask   UAV_SLOT(1)
+#define sinks  UAV_SLOT(2)
+#define dst    UAV_SLOT(3)
 
 cbuffer Params : register(b0) {
     uint offset_src0;
@@ -75,7 +75,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const float head  = (float) i2;
     float slope = 1.0f;
     if (max_bias > 0.0f) {
-        slope = head < n_head_log2 ? pow(m0, head + 1.0f) : pow(m1, 2.0f * (head - n_head_log2) + 1.0f);
+        slope = head < n_head_log2 ? pow(abs(m0), head + 1.0f) : pow(abs(m1), 2.0f * (head - n_head_log2) + 1.0f);
     }
 
     float cache[CACHE_SIZE];

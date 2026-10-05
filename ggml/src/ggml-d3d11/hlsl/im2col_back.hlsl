@@ -7,8 +7,8 @@
 // landed on this pixel contributes; a stride that skipped the pixel leaves a non-zero
 // remainder and is dropped. The arithmetic is signed: tmpw can go negative.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint u_N;

@@ -11,9 +11,9 @@
 // same way here; accumulation stays f32.
 // defines: KNL_F16 (with USE_16BIT)
 
-RWByteAddressBuffer knl : register(u0);   // src0 {KW, KH, KD, OC*C}, contiguous
-RWByteAddressBuffer src : register(u1);   // src1 {W, H, D, N*C}
-RWByteAddressBuffer dst : register(u2);   // dst  {OW, OH, OD, N*OC}
+#define knl  UAV_SLOT(0)   // src0 {KW, KH, KD, OC*C}, contiguous
+#define src  UAV_SLOT(1)   // src1 {W, H, D, N*C}
+#define dst  UAV_SLOT(2)   // dst  {OW, OH, OD, N*OC}
 
 cbuffer Params : register(b0) {
     uint offset_knl;

@@ -4,9 +4,9 @@
 // ggml_silu_backward_f32. src[0] is the incoming gradient dy, src[1] is the forward input x.
 // Elementwise: one thread each.
 
-RWByteAddressBuffer dy_buf : register(u0);
-RWByteAddressBuffer x_buf  : register(u1);
-RWByteAddressBuffer dst    : register(u2);
+#define dy_buf  UAV_SLOT(0)
+#define x_buf   UAV_SLOT(1)
+#define dst     UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_dy;

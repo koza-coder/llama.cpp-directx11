@@ -7,9 +7,9 @@
 // hit by exactly the taps i00 for which o - i00 is a non-negative multiple of s0, so one thread can
 // own one output element, gather those taps and need neither the zero pass nor the staging buffers.
 
-RWByteAddressBuffer knl : register(u0);   // src0 {K, Cout, Cin}
-RWByteAddressBuffer src : register(u1);   // src1 {L, Cin}
-RWByteAddressBuffer dst : register(u2);
+#define knl  UAV_SLOT(0)   // src0 {K, Cout, Cin}
+#define src  UAV_SLOT(1)   // src1 {L, Cin}
+#define dst  UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_knl;

@@ -16,23 +16,23 @@
 
 #define ROWS (WG_SIZE / TPR)
 
-RWByteAddressBuffer src1   : register(u0);
-RWByteAddressBuffer src0_0 : register(u1);
-RWByteAddressBuffer dst_0  : register(u2);
-RWByteAddressBuffer add_0  : register(u3);
+#define src1    UAV_SLOT(0)
+#define src0_0  UAV_SLOT(1)
+#define dst_0   UAV_SLOT(2)
+#define add_0   UAV_SLOT(3)
 #if defined(MMID)
 // MUL_MAT_ID: one expert matrix per id, N_MATS is always 1 and the add slot is unused
-RWByteAddressBuffer ids    : register(u4);
+#define ids     UAV_SLOT(4)
 #endif
 #if N_MATS >= 2
-RWByteAddressBuffer src0_1 : register(u4);
-RWByteAddressBuffer dst_1  : register(u5);
-RWByteAddressBuffer add_1  : register(u6);
+#define src0_1  UAV_SLOT(4)
+#define dst_1   UAV_SLOT(5)
+#define add_1   UAV_SLOT(6)
 #endif
 #if N_MATS >= 3
-RWByteAddressBuffer src0_2 : register(u7);
-RWByteAddressBuffer dst_2  : register(u8);
-RWByteAddressBuffer add_2  : register(u9);
+#define src0_2  UAV_SLOT(7)
+#define dst_2   UAV_SLOT(8)
+#define add_2   UAV_SLOT(9)
 #endif
 
 #define MAT_PARAMS(M) \

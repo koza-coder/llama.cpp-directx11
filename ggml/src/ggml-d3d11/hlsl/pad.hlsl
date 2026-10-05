@@ -4,8 +4,8 @@
 // value is 0, or with CIRCULAR the source index wraps around, which is ggml's circular pad mode.
 // dst is contiguous; src keeps its own strides.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

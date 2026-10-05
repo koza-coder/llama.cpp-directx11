@@ -4,9 +4,9 @@
 // forward output y. dx[k] = y[k] * (dy[k] - dot(y, dy)) * scale.
 // All three tensors are contiguous, so a row is just row_index * ne0.
 
-RWByteAddressBuffer dy_buf : register(u0);
-RWByteAddressBuffer y_buf  : register(u1);
-RWByteAddressBuffer dst    : register(u2);
+#define dy_buf  UAV_SLOT(0)
+#define y_buf   UAV_SLOT(1)
+#define dst     UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_dy;

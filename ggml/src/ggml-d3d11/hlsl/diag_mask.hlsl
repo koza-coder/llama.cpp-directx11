@@ -4,8 +4,8 @@
 // shifted by n_past replaced by mask_value. Both tensors are contiguous, so one flat index
 // over dst is enough and the element may be written in place.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint  offset_src;

@@ -8,10 +8,10 @@
 // the column scatter, because the column scatter's index jdw + j * ne10 simplifies to
 // jp1 * ne10 + i10 + j * ne10.
 
-RWByteAddressBuffer src0 : register(u0);
-RWByteAddressBuffer src1 : register(u1);
-RWByteAddressBuffer src2 : register(u2);
-RWByteAddressBuffer dst  : register(u3);
+#define src0  UAV_SLOT(0)
+#define src1  UAV_SLOT(1)
+#define src2  UAV_SLOT(2)
+#define dst   UAV_SLOT(3)
 
 cbuffer Params : register(b0) {
     uint offset_src0;

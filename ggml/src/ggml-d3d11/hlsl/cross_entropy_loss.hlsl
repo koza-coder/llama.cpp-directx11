@@ -6,9 +6,9 @@
 //   dst = -acc / n_rows
 // src0 (logits) and src1 (labels) are contiguous and the same shape.
 
-RWByteAddressBuffer s0_buf : register(u0);
-RWByteAddressBuffer s1_buf : register(u1);
-RWByteAddressBuffer dst    : register(u2);
+#define s0_buf  UAV_SLOT(0)
+#define s1_buf  UAV_SLOT(1)
+#define dst     UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_s0;

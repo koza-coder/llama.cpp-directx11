@@ -17,10 +17,10 @@
 #define STORE(buf, i, v) STORE_F32(buf, i, v)
 #endif
 
-RWByteAddressBuffer src0 : register(u0);
-RWByteAddressBuffer src1 : register(u1);   // positions, i32
-RWByteAddressBuffer src2 : register(u2);   // frequency factors, f32
-RWByteAddressBuffer dst  : register(u3);
+#define src0  UAV_SLOT(0)
+#define src1  UAV_SLOT(1)   // positions, i32
+#define src2  UAV_SLOT(2)   // frequency factors, f32
+#define dst   UAV_SLOT(3)
 
 cbuffer Params : register(b0) {
     uint offset_src0;
@@ -144,7 +144,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
         }
     }
     const float pos        = (float) LOAD_I32(src1, offset_src1 + i2 + ne2 * theta_base_mult);
-    const float theta_base = pos * pow(theta_scale, (float) theta_scale_pwr);
+    const float theta_base = pos * pow(abs(theta_scale), (float) theta_scale_pwr);
     const float2 thetas    = rope_yarn(theta_base / freq_factor(iw), iw);
 
     const bool div2 = is_neox || is_mrope || is_vision;

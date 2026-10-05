@@ -7,8 +7,8 @@
 //   j >= p0 + src_ne0  -> k = 2 * (src_ne0 - 1) - (j - p0)
 //   otherwise          -> k = j - p0
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

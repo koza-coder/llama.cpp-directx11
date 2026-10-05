@@ -4,8 +4,8 @@
 // The CPU already gathers rather than scatters, so this is a direct transcription: one thread owns
 // one output sample and sums the at most ceil(K/s) columns that overlap it.
 
-RWByteAddressBuffer src : register(u0);   // [K*OC, T_in]
-RWByteAddressBuffer dst : register(u1);   // [T_out, OC]
+#define src  UAV_SLOT(0)   // [K*OC, T_in]
+#define dst  UAV_SLOT(1)   // [T_out, OC]
 
 cbuffer Params : register(b0) {
     uint offset_src;

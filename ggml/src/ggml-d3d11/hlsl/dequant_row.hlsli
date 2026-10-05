@@ -12,11 +12,11 @@ float e8m0_to_f32_half(uint e) {
 
 static const float KVALUES_IQ4NL[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
 // partial dot products of one src0 row against the active columns of src1, strided by lane
-void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, uint src1_base[MAX_COLS],
+void dot_row(RWByteAddressBuffer wbuf, uint src0_base, uint lane, uint ncols, uint src1_base[MAX_COLS],
              inout float acc[MAX_COLS]) {
 #if defined(SRC0_F32)
     for (uint i = lane * 4; i < k; i += TPR * 4) {
-        const uint4 w = src0.Load4((src0_base + i) * 4);
+        const uint4 w = wbuf.Load4((src0_base + i) * 4);
         ACC(asfloat(w.x), i);
         ACC(asfloat(w.y), i + 1);
         ACC(asfloat(w.z), i + 2);
@@ -25,23 +25,67 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
 #elif defined(SRC0_F16)
     for (uint i = lane * 4; i < k; i += TPR * 4) {
         uint w0, w1;
-        LOAD_U32_UNALIGNED(src0, (src0_base + i) * 2, w0);
-        LOAD_U32_UNALIGNED(src0, (src0_base + i) * 2 + 4, w1);
+        LOAD_U32_UNALIGNED(wbuf, (src0_base + i) * 2, w0);
+        LOAD_U32_UNALIGNED(wbuf, (src0_base + i) * 2 + 4, w1);
         ACC(f16tof32(w0 & 0xFFFFu), i);
         ACC(f16tof32(w0 >> 16), i + 1);
         ACC(f16tof32(w1 & 0xFFFFu), i + 2);
         ACC(f16tof32(w1 >> 16), i + 3);
+    }
+#elif defined(SRC0_Q4_0) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: the block as one 20-byte window (Load4 + Load) and src1 in Load4s. cs_5_0 (FXC) keeps the
+    // scalar loads of the generic path apart: 41 load messages per block there, 13 here.
+    // Blocks start on 2 bytes: odd = the block starts at byte 2 of the window.
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 18;
+        const uint  a0   = base & ~3u;
+        const bool  odd  = (base & 2u) != 0;
+        const uint4 w03  = wbuf.Load4(a0);
+        const uint  W[5] = { w03.x, w03.y, w03.z, w03.w, wbuf.Load(a0 + 16) };
+        const float d    = f16tof32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+        const uint  ys   = (src1_base[0] + blk * 32) * 4;
+        float       sum  = 0.0f;
+        [unroll] for (uint j = 0; j < 4; j++) {
+            const uint   q   = odd ? W[j + 1] : ((W[j] >> 16) | (W[j + 1] << 16));
+            const float4 ylo = asfloat(src1.Load4(ys + 16 * j));
+            const float4 yhi = asfloat(src1.Load4(ys + 64 + 16 * j));
+            sum += ((float) ( q        & 0xFu) - 8.0f) * ylo.x + ((float) ((q >>  8) & 0xFu) - 8.0f) * ylo.y +
+                   ((float) ((q >> 16) & 0xFu) - 8.0f) * ylo.z + ((float) ((q >> 24) & 0xFu) - 8.0f) * ylo.w +
+                   ((float) ((q >>  4) & 0xFu) - 8.0f) * yhi.x + ((float) ((q >> 12) & 0xFu) - 8.0f) * yhi.y +
+                   ((float) ((q >> 20) & 0xFu) - 8.0f) * yhi.z + ((float) ( q >> 28        ) - 8.0f) * yhi.w;
+        }
+        acc[0] += sum * d;
+    }
+#elif defined(SRC0_Q8_0) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: the 34-byte block as one 36-byte window (2x Load4 + Load) and src1 in Load4s
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 34;
+        const uint  a0   = base & ~3u;
+        const bool  odd  = (base & 2u) != 0;
+        const uint4 wa   = wbuf.Load4(a0);
+        const uint4 wb   = wbuf.Load4(a0 + 16);
+        const uint  W[9] = { wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w, wbuf.Load(a0 + 32) };
+        const float d    = f16tof32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+        const uint  ys   = (src1_base[0] + blk * 32) * 4;
+        float       sum  = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint   q = odd ? W[j + 1] : ((W[j] >> 16) | (W[j + 1] << 16));
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            sum += (float) sbyte_of(q, 0) * y.x + (float) sbyte_of(q, 1) * y.y +
+                   (float) sbyte_of(q, 2) * y.z + (float) sbyte_of(q, 3) * y.w;
+        }
+        acc[0] += sum * d;
     }
 #elif defined(SRC0_Q4_0)
     // block: f16 d, 16 bytes of nibbles; low nibbles are elements 0..15, high nibbles 16..31
     for (uint blk = lane; blk < k / 32; blk += TPR) {
         const uint base = (src0_base + blk) * 18;
         uint dbits;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
         const float d = f16tof32(dbits);
         [unroll] for (uint j = 0; j < 4; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint byte = byte_of(q, b);
                 ACC(((float) (byte & 0xFu) - 8.0f) * d, blk * 32 + j * 4 + b);
@@ -54,12 +98,12 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
     for (uint blk = lane; blk < k / 32; blk += TPR) {
         const uint base = (src0_base + blk) * 20;
         uint w;
-        LOAD_U32_UNALIGNED(src0, base, w);
+        LOAD_U32_UNALIGNED(wbuf, base, w);
         const float d = f16tof32(w & 0xFFFFu);
         const float m = f16tof32(w >> 16);
         [unroll] for (uint j = 0; j < 4; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 4 + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 4 + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint byte = byte_of(q, b);
                 ACC((float) (byte & 0xFu) * d + m, blk * 32 + j * 4 + b);
@@ -80,8 +124,8 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
     for (uint blk = lane; blk < k / 32; blk += TPR) {
         const uint base = (src0_base + blk) * bsize;
         uint w, qh;
-        LOAD_U32_UNALIGNED(src0, base, w);
-        LOAD_U32_UNALIGNED(src0, base + hoff, qh);
+        LOAD_U32_UNALIGNED(wbuf, base, w);
+        LOAD_U32_UNALIGNED(wbuf, base + hoff, qh);
         const float d = f16tof32(w & 0xFFFFu);
 #if defined(SRC0_Q5_0)
         const float m = -16.0f * d;
@@ -90,7 +134,7 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
 #endif
         [unroll] for (uint j = 0; j < 4; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + hoff + 4 + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + hoff + 4 + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint byte = byte_of(q, b);
                 const uint e    = j * 4 + b;
@@ -102,8 +146,8 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
 #elif defined(SRC0_BF16)
     for (uint i = lane * 4; i < k; i += TPR * 4) {
         uint w0, w1;
-        LOAD_U32_UNALIGNED(src0, (src0_base + i) * 2, w0);
-        LOAD_U32_UNALIGNED(src0, (src0_base + i) * 2 + 4, w1);
+        LOAD_U32_UNALIGNED(wbuf, (src0_base + i) * 2, w0);
+        LOAD_U32_UNALIGNED(wbuf, (src0_base + i) * 2 + 4, w1);
         ACC(asfloat(w0 << 16), i);
         ACC(asfloat(w0 & 0xFFFF0000u), i + 1);
         ACC(asfloat(w1 << 16), i + 2);
@@ -114,11 +158,11 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
     for (uint blk = lane; blk < k / 32; blk += TPR) {
         const uint base = (src0_base + blk) * 17;
         uint ebits;
-        LOAD_U16_UNALIGNED(src0, base & ~1u, ebits);
+        LOAD_U16_UNALIGNED(wbuf, base & ~1u, ebits);
         const float d = e8m0_to_f32_half((base & 1u) != 0 ? (ebits >> 8) : (ebits & 0xFFu));
         [unroll] for (uint j = 0; j < 4; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 1 + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 1 + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint byte = byte_of(q, b);
                 ACC(KVALUES_MXFP4[byte & 0xFu] * d, blk * 32 + j * 4 + b);
@@ -131,11 +175,11 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
     for (uint blk = lane; blk < k / 32; blk += TPR) {
         const uint base = (src0_base + blk) * 18;
         uint dbits;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
         const float d = f16tof32(dbits);
         [unroll] for (uint j = 0; j < 4; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint byte = byte_of(q, b);
                 ACC(KVALUES_IQ4NL[byte & 0xFu] * d, blk * 32 + j * 4 + b);
@@ -148,15 +192,90 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
     for (uint blk = lane; blk < k / 32; blk += TPR) {
         const uint base = (src0_base + blk) * 34;
         uint dbits;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
         const float d = f16tof32(dbits);
         [unroll] for (uint j = 0; j < 8; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 ACC((float) sbyte_of(q, b) * d, blk * 32 + j * 4 + b);
             }
         }
+    }
+#elif defined(SRC0_Q4_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: header and nibbles as Load4s (144-byte blocks are 16-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 144;
+        const uint4 hd   = wbuf.Load4(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const float dmin = f16tof32(hd.x >> 16);
+        uint sc, mn;
+        if (s < 4) {
+            sc = byte_of(hd.y, s) & 63u;
+            mn = byte_of(hd.z, s) & 63u;
+        } else {
+            sc = (byte_of(hd.w, s - 4) & 0xFu) | ((byte_of(hd.y, s - 4) >> 6) << 4);
+            mn = (byte_of(hd.w, s - 4) >> 4) | ((byte_of(hd.z, s - 4) >> 6) << 4);
+        }
+        const uint  shift = (s & 1u) * 4u;
+        const uint  qbase = base + 16 + 32 * (s / 2);
+        const uint4 q0    = wbuf.Load4(qbase);
+        const uint4 q1    = wbuf.Load4(qbase + 16);
+        const uint  Q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  ys    = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sq = 0.0f, sy = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   q = Q[j] >> shift;
+            sq += (float) (q & 0xFu) * y.x + (float) ((q >> 8) & 0xFu) * y.y +
+                  (float) ((q >> 16) & 0xFu) * y.z + (float) ((q >> 24) & 0xFu) * y.w;
+            sy += y.x + y.y + y.z + y.w;
+        }
+        acc[0] += d * (float) sc * sq - dmin * (float) mn * sy;
+    }
+#elif defined(SRC0_Q6_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: ql and qh as 36-byte windows (2x Load4 + Load; 210-byte blocks start on 2 bytes), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint h    = s / 4;
+        const uint t    = s % 4;
+        const uint base = (src0_base + blk) * 210;
+        uint dbits;
+        LOAD_U16_UNALIGNED(wbuf, base + 208, dbits);
+        const float d = f16tof32(dbits);
+        const uint  ql_base = base + 64 * h + 32 * (t & 1u);
+        const uint  qh_base = base + 128 + 32 * h;
+        const uint  sc_base = base + 192 + 8 * h + 2 * t;
+        const uint  lshift  = (t >> 1) * 4u;
+        const uint  hshift  = t * 2u;
+        uint scw;
+        LOAD_U32_UNALIGNED(wbuf, sc_base, scw);
+        const bool  odd  = (base & 2u) != 0;   // ql_base and qh_base share base's 4-byte phase
+        const uint  la   = ql_base & ~3u;
+        const uint  ha   = qh_base & ~3u;
+        const uint4 l0   = wbuf.Load4(la);
+        const uint4 l1   = wbuf.Load4(la + 16);
+        const uint4 h0   = wbuf.Load4(ha);
+        const uint4 h1   = wbuf.Load4(ha + 16);
+        const uint  L[9] = { l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w, wbuf.Load(la + 32) };
+        const uint  H[9] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w, wbuf.Load(ha + 32) };
+        const uint  ys   = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint   ql = odd ? ((L[j] >> 16) | (L[j + 1] << 16)) : L[j];
+            const uint   qh = odd ? ((H[j] >> 16) | (H[j + 1] << 16)) : H[j];
+            const float4 y  = asfloat(src1.Load4(ys + 16 * j));
+            float p = 0.0f;
+            [unroll] for (uint b = 0; b < 4; b++) {
+                const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;
+                p += (float) q * y[b];
+            }
+            if (j < 4) { sum0 += p; } else { sum1 += p; }
+        }
+        acc[0] += d * ((float) sbyte_of(scw, 0) * sum0 + (float) sbyte_of(scw, 1) * sum1);
     }
 #elif defined(SRC0_Q4_K)
     // super-block of 256: f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 128 bytes of nibbles.
@@ -166,13 +285,13 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 144;
         uint w;
-        LOAD_U32_UNALIGNED(src0, base, w);
+        LOAD_U32_UNALIGNED(wbuf, base, w);
         const float d    = f16tof32(w & 0xFFFFu);
         const float dmin = f16tof32(w >> 16);
         uint sc0, sc1, sc2;
-        LOAD_U32_UNALIGNED(src0, base + 4, sc0);
-        LOAD_U32_UNALIGNED(src0, base + 8, sc1);
-        LOAD_U32_UNALIGNED(src0, base + 12, sc2);
+        LOAD_U32_UNALIGNED(wbuf, base + 4, sc0);
+        LOAD_U32_UNALIGNED(wbuf, base + 8, sc1);
+        LOAD_U32_UNALIGNED(wbuf, base + 12, sc2);
         uint sc, mn;
         if (s < 4) {
             sc = byte_of(sc0, s) & 63u;
@@ -187,7 +306,7 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint  qbase = base + 16 + 32 * (s / 2);
         [unroll] for (uint j = 0; j < 8; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, qbase + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const float v = dl * (float) ((byte_of(q, b) >> shift) & 0xFu) - ml;
                 ACC(v, blk * 256 + s * 32 + j * 4 + b);
@@ -202,13 +321,13 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 176;
         uint w;
-        LOAD_U32_UNALIGNED(src0, base, w);
+        LOAD_U32_UNALIGNED(wbuf, base, w);
         const float d    = f16tof32(w & 0xFFFFu);
         const float dmin = f16tof32(w >> 16);
         uint sc0, sc1, sc2;
-        LOAD_U32_UNALIGNED(src0, base + 4, sc0);
-        LOAD_U32_UNALIGNED(src0, base + 8, sc1);
-        LOAD_U32_UNALIGNED(src0, base + 12, sc2);
+        LOAD_U32_UNALIGNED(wbuf, base + 4, sc0);
+        LOAD_U32_UNALIGNED(wbuf, base + 8, sc1);
+        LOAD_U32_UNALIGNED(wbuf, base + 12, sc2);
         uint sc, mn;
         if (s < 4) {
             sc = byte_of(sc0, s) & 63u;
@@ -223,8 +342,8 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint  qbase = base + 48 + 32 * (s / 2);
         [unroll] for (uint j = 0; j < 8; j++) {
             uint q, h;
-            LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
-            LOAD_U32_UNALIGNED(src0, base + 16 + 4 * j, h);
+            LOAD_U32_UNALIGNED(wbuf, qbase + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 16 + 4 * j, h);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint v5 = ((byte_of(q, b) >> shift) & 0xFu) | (((byte_of(h, b) >> s) & 1u) << 4);
                 ACC(dl * (float) v5 - ml, blk * 256 + s * 32 + j * 4 + b);
@@ -239,10 +358,10 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 84;
         uint w, scw;
-        LOAD_U32_UNALIGNED(src0, base + 80, w);
+        LOAD_U32_UNALIGNED(wbuf, base + 80, w);
         const float d    = f16tof32(w & 0xFFFFu);
         const float dmin = f16tof32(w >> 16);
-        LOAD_U16_UNALIGNED(src0, base + 2 * s, scw);
+        LOAD_U16_UNALIGNED(wbuf, base + 2 * s, scw);
         const float dl0 = d * (float) (scw & 0xFu);
         const float ml0 = dmin * (float) ((scw >> 4) & 0xFu);
         const float dl1 = d * (float) ((scw >> 8) & 0xFu);
@@ -251,7 +370,7 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint  qbase = base + 16 + 32 * (s / 4);
         [unroll] for (uint j = 0; j < 8; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, qbase + 4 * j, q);
             const float dl = j < 4 ? dl0 : dl1;
             const float ml = j < 4 ? ml0 : ml1;
             [unroll] for (uint b = 0; b < 4; b++) {
@@ -268,7 +387,7 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 110;
         uint dbits;
-        LOAD_U16_UNALIGNED(src0, base + 108, dbits);
+        LOAD_U16_UNALIGNED(wbuf, base + 108, dbits);
         const float d = f16tof32(dbits);
         float dls[2];
         [unroll] for (uint h = 0; h < 2; h++) {
@@ -276,13 +395,13 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             // single bytes at odd offsets: LOAD_U16_UNALIGNED only handles even addresses
             uint lo, hi;
             if (is < 8) {
-                LOAD_U32_UNALIGNED(src0, base + 96 + is, lo);
+                LOAD_U32_UNALIGNED(wbuf, base + 96 + is, lo);
                 lo = lo & 0xFu;
             } else {
-                LOAD_U32_UNALIGNED(src0, base + 96 + is - 8, lo);
+                LOAD_U32_UNALIGNED(wbuf, base + 96 + is - 8, lo);
                 lo = (lo >> 4) & 0xFu;
             }
-            LOAD_U32_UNALIGNED(src0, base + 104 + is % 4, hi);
+            LOAD_U32_UNALIGNED(wbuf, base + 104 + is % 4, hi);
             hi = (hi >> (2 * (is / 4))) & 3u;
             dls[h] = d * ((float) (lo | (hi << 4)) - 32.0f);
         }
@@ -290,8 +409,8 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint qbase = base + 32 + 32 * (s / 4);
         [unroll] for (uint j = 0; j < 8; j++) {
             uint q, hm;
-            LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
-            LOAD_U32_UNALIGNED(src0, base + 4 * j, hm);
+            LOAD_U32_UNALIGNED(wbuf, qbase + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 4 * j, hm);
             const float dl = dls[j < 4 ? 0 : 1];
             [unroll] for (uint b = 0; b < 4; b++) {
                 const int qv = (int) ((byte_of(q, b) >> shift) & 3u) - (((byte_of(hm, b) >> s) & 1u) != 0 ? 0 : 4);
@@ -307,14 +426,14 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 136;
         uint w, sl;
-        LOAD_U32_UNALIGNED(src0, base, w);
-        LOAD_U32_UNALIGNED(src0, base + 4, sl);
+        LOAD_U32_UNALIGNED(wbuf, base, w);
+        LOAD_U32_UNALIGNED(wbuf, base + 4, sl);
         const float d  = f16tof32(w & 0xFFFFu);
         const uint  ls = ((byte_of(sl, s / 2) >> (4 * (s % 2))) & 0xFu) | ((((w >> 16) >> (2 * s)) & 3u) << 4);
         const float dl = d * ((float) ls - 32.0f);
         [unroll] for (uint j = 0; j < 4; j++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 8 + 16 * s + 4 * j, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 8 + 16 * s + 4 * j, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 const uint byte = byte_of(q, b);
                 ACC(KVALUES_IQ4NL[byte & 0xFu] * dl, blk * 256 + s * 32 + j * 4 + b);
@@ -332,14 +451,14 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 110;
         uint dbits, sc, qh;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
-        LOAD_U32_UNALIGNED(src0, base + 106 + s / 2, sc);
-        LOAD_U32_UNALIGNED(src0, base + 66 + s, qh);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 106 + s / 2, sc);
+        LOAD_U32_UNALIGNED(wbuf, base + 66 + s, qh);
         const float db = f16tof32(dbits) * (float) (1u + 2u * ((sc >> (4u * (s & 1u))) & 0xFu));
         [unroll] for (uint l = 0; l < 4; l++) {
             uint q, sg;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s + 2 * l, q);
-            LOAD_U32_UNALIGNED(src0, base + 74 + 4 * s + l, sg);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 8 * s + 2 * l, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 74 + 4 * s + l, sg);
             const uint g1 = IQ3S_GRID[(q & 0xFFu) | (((qh >> (2u * l)) & 1u) << 8)];
             const uint g2 = IQ3S_GRID[((q >> 8) & 0xFFu) | (((qh >> (2u * l + 1u)) & 1u) << 8)];
             [unroll] for (uint j = 0; j < 8; j++) {
@@ -358,14 +477,14 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 82;
         uint dbits, sc, qh;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
-        LOAD_U32_UNALIGNED(src0, base + 74 + s, sc);
-        LOAD_U32_UNALIGNED(src0, base + 66 + s, qh);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 74 + s, sc);
+        LOAD_U32_UNALIGNED(wbuf, base + 66 + s, qh);
         const float d = f16tof32(dbits);
         [unroll] for (uint l = 0; l < 4; l++) {
             uint q, sg;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * s + l, q);
-            LOAD_U32_UNALIGNED(src0, base + 34 + 4 * s + l, sg);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * s + l, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 34 + 4 * s + l, sg);
             const uint  gi = (q & 0xFFu) | (((qh >> (2u * l)) & 3u) << 8);
             const float dl = d * (0.5f + (float) ((sc >> (l < 2 ? 0u : 4u)) & 0xFu)) * 0.25f;
             [unroll] for (uint j = 0; j < 8; j++) {
@@ -384,9 +503,9 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 66;
         uint dbits, a0, a1;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
-        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, a0);
-        LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, a1);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 2 + 8 * s, a0);
+        LOAD_U32_UNALIGNED(wbuf, base + 6 + 8 * s, a1);
         const float db = f16tof32(dbits) * (0.5f + (float) (a1 >> 28)) * 0.25f;
         [unroll] for (uint l = 0; l < 4; l++) {
             const uint gi = byte_of(a0, l);
@@ -407,14 +526,14 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 74;
         uint dbits, sc;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
-        LOAD_U32_UNALIGNED(src0, base + 66 + s, sc);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 66 + s, sc);
         const float d   = f16tof32(dbits);
         const float db0 = d * (0.5f + (float) (sc & 0xFu)) * 0.25f;
         const float db1 = d * (0.5f + (float) ((sc >> 4) & 0xFu)) * 0.25f;
         [unroll] for (uint l = 0; l < 4; l++) {
             uint q;
-            LOAD_U16_UNALIGNED(src0, base + 2 + 2 * (4 * s + l), q);
+            LOAD_U16_UNALIGNED(wbuf, base + 2 + 2 * (4 * s + l), q);
             const uint  gi = q & 511u;
             const uint  sg = KSIGNS[(q >> 9) & 127u];
             const float dl = l < 2 ? db0 : db1;
@@ -435,12 +554,12 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 98;
         uint dbits, aux;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
-        LOAD_U32_UNALIGNED(src0, base + 66 + 4 * s, aux);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 66 + 4 * s, aux);
         const float db = f16tof32(dbits) * (0.5f + (float) (aux >> 28)) * 0.5f;
         [unroll] for (uint l = 0; l < 4; l++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s + 2 * l, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 8 * s + 2 * l, q);
             const uint sg = KSIGNS[(aux >> (7u * l)) & 127u];
             const uint g1 = IQ3XXS_GRID[q & 0xFFu];
             const uint g2 = IQ3XXS_GRID[(q >> 8) & 0xFFu];
@@ -464,18 +583,68 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 50;
         uint dbits, qh;
-        LOAD_U16_UNALIGNED(src0, base, dbits);
-        LOAD_U16_UNALIGNED(src0, base + 34 + 2 * s, qh);
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U16_UNALIGNED(wbuf, base + 34 + 2 * s, qh);
         const float dl    = f16tof32(dbits) * (float) (2u * ((qh >> 12) & 7u) + 1u);
         const float delta = (qh & 0x8000u) != 0 ? -0.125f : 0.125f;
         [unroll] for (uint l = 0; l < 4; l++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * s + l, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * s + l, q);
             const uint gi = (q & 0xFFu) | (((qh >> (3u * l)) & 7u) << 8);
             [unroll] for (uint j = 0; j < 8; j++) {
                 const int gv = j < 4 ? sbyte_of(IQ1S_GRID_LO[gi], j) : sbyte_of(IQ1S_GRID_HI[gi], j - 4);
                 ACC(dl * ((float) gv + delta), blk * 256 + s * 32 + l * 8 + j);
             }
+        }
+    }
+#elif defined(SRC0_TQ2_0)
+    // super-block of 256 (66 bytes): 64 bytes qs, f16 d. Value h * 128 + l * 32 + m is bits 2l..2l+1 of
+    // qs[h * 32 + m], minus 1, times d. Sub-block s (of 8) = half h = s / 4, shift l = s % 4. (port of the OpenGL path)
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint h    = s / 4;
+        const uint l    = s % 4;
+        const uint base = (src0_base + blk) * 66;
+        uint dbits;
+        LOAD_U16_UNALIGNED(wbuf, base + 64, dbits);
+        const float d = f16tof32(dbits);
+        for (uint w = 0; w < 8; w++) {
+            uint q;
+            LOAD_U32_UNALIGNED(wbuf, base + h * 32 + 4 * w, q);
+            [unroll] for (uint b = 0; b < 4; b++) {
+                ACC(((float) ((byte_of(q, b) >> (2 * l)) & 3u) - 1.0f) * d, blk * 256 + h * 128 + l * 32 + w * 4 + b);
+            }
+        }
+    }
+#elif defined(SRC0_Q1_0)
+    // block of 128 (18 bytes): f16 d, 16 bytes of sign bits; bit j of the block is +d when set, -d when clear
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 4;
+        const uint s    = sb % 4;
+        const uint base = (src0_base + blk) * 18;
+        uint dbits, q;
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * s, q);
+        const float d = f16tof32(dbits);
+        for (uint j = 0; j < 32; j++) {
+            ACC(((q >> j) & 1u) != 0u ? d : -d, blk * 128 + s * 32 + j);
+        }
+    }
+#elif defined(SRC0_Q2_0)
+    // block of 64 (18 bytes): f16 d, 16 bytes of 2-bit codes q (4 per byte, low bits first); value = (q - 1) * d
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 2;
+        const uint s    = sb % 2;
+        const uint base = (src0_base + blk) * 18;
+        uint dbits, q0, q1;
+        LOAD_U16_UNALIGNED(wbuf, base, dbits);
+        LOAD_U32_UNALIGNED(wbuf, base + 2 + 8 * s, q0);
+        LOAD_U32_UNALIGNED(wbuf, base + 6 + 8 * s, q1);
+        const float d = f16tof32(dbits);
+        for (uint j = 0; j < 16; j++) {
+            ACC(((float) ((q0 >> (2 * j)) & 3u) - 1.0f) * d, blk * 64 + s * 32 + j);
+            ACC(((float) ((q1 >> (2 * j)) & 3u) - 1.0f) * d, blk * 64 + s * 32 + 16 + j);
         }
     }
 #elif defined(SRC0_IQ1_M)
@@ -488,10 +657,10 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint s    = sb % 8;
         const uint base = (src0_base + blk) * 56;
         uint sc0, sc1, sc2, sc3;
-        LOAD_U16_UNALIGNED(src0, base + 48, sc0);
-        LOAD_U16_UNALIGNED(src0, base + 50, sc1);
-        LOAD_U16_UNALIGNED(src0, base + 52, sc2);
-        LOAD_U16_UNALIGNED(src0, base + 54, sc3);
+        LOAD_U16_UNALIGNED(wbuf, base + 48, sc0);
+        LOAD_U16_UNALIGNED(wbuf, base + 50, sc1);
+        LOAD_U16_UNALIGNED(wbuf, base + 52, sc2);
+        LOAD_U16_UNALIGNED(wbuf, base + 54, sc3);
         const uint  sbits = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
         const float d     = f16tof32(sbits);
 
@@ -501,12 +670,12 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const float dl2 = d * (float) (2u * ((sc >> (sh + 3u)) & 7u) + 1u);
 
         uint qh0, qh1;
-        LOAD_U32_UNALIGNED(src0, base + 32 + 2 * s, qh0);
+        LOAD_U32_UNALIGNED(wbuf, base + 32 + 2 * s, qh0);
         qh1 = (qh0 >> 8) & 0xFFu;
         qh0 = qh0 & 0xFFu;
         [unroll] for (uint l = 0; l < 4; l++) {
             uint q;
-            LOAD_U32_UNALIGNED(src0, base + 4 * s + l, q);
+            LOAD_U32_UNALIGNED(wbuf, base + 4 * s + l, q);
             const uint h  = l < 2 ? qh0 : qh1;
             const uint gi = (q & 0xFFu) | (((l & 1u) == 0 ? (h << 8) : (h << 4)) & 0x700u);
             const float delta = (h & ((l & 1u) == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f : 0.125f;
@@ -527,7 +696,7 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint t    = s % 4;
         const uint base = (src0_base + blk) * 210;
         uint dbits;
-        LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+        LOAD_U16_UNALIGNED(wbuf, base + 208, dbits);
         const float d = f16tof32(dbits);
         const uint  ql_base = base + 64 * h + 32 * (t & 1u);
         const uint  qh_base = base + 128 + 32 * h;
@@ -535,13 +704,13 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         const uint  lshift  = (t >> 1) * 4u;
         const uint  hshift  = t * 2u;
         uint scw;
-        LOAD_U32_UNALIGNED(src0, sc_base, scw);
+        LOAD_U32_UNALIGNED(wbuf, sc_base, scw);
         const float d0 = d * (float) sbyte_of(scw, 0);
         const float d1 = d * (float) sbyte_of(scw, 1);
         [unroll] for (uint j = 0; j < 8; j++) {
             uint ql, qh;
-            LOAD_U32_UNALIGNED(src0, ql_base + 4 * j, ql);
-            LOAD_U32_UNALIGNED(src0, qh_base + 4 * j, qh);
+            LOAD_U32_UNALIGNED(wbuf, ql_base + 4 * j, ql);
+            LOAD_U32_UNALIGNED(wbuf, qh_base + 4 * j, qh);
             const float dsc = (j < 4) ? d0 : d1;
             [unroll] for (uint b = 0; b < 4; b++) {
                 const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;

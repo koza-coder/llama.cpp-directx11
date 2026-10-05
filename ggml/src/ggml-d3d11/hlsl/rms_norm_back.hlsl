@@ -6,9 +6,9 @@
 //   mean_eps = sum_xx/ne0 + eps      sum_eps = sum_xx + eps*ne0
 //   dx = (dz + x*(-sum_xdz/sum_eps)) * rsqrt(mean_eps)
 
-RWByteAddressBuffer dz_buf : register(u0);
-RWByteAddressBuffer x_buf  : register(u1);
-RWByteAddressBuffer dst    : register(u2);
+#define dz_buf  UAV_SLOT(0)
+#define x_buf   UAV_SLOT(1)
+#define dst     UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_dz;

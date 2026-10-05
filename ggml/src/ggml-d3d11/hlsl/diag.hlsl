@@ -3,8 +3,8 @@
 // DIAG (f32): turn each vector into a diagonal matrix. src is [ne0, 1, ne2, ne3] and dst is
 // [ne0, ne0, ne2, ne3], with dst[i0, i1, ...] = i0 == i1 ? src[i1, 0, ...] : 0.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

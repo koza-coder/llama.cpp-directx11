@@ -9,10 +9,10 @@
 
 #define HC 4
 
-RWByteAddressBuffer m_buf : register(u0);   // mixes {(2 + hc)*hc, n_tokens}
-RWByteAddressBuffer s_buf : register(u1);   // scale, element 2 is the comb scale
-RWByteAddressBuffer b_buf : register(u2);   // base {(2 + hc)*hc}
-RWByteAddressBuffer dst   : register(u3);   // {hc, hc, n_tokens}
+#define m_buf  UAV_SLOT(0)   // mixes {(2 + hc)*hc, n_tokens}
+#define s_buf  UAV_SLOT(1)   // scale, element 2 is the comb scale
+#define b_buf  UAV_SLOT(2)   // base {(2 + hc)*hc}
+#define dst    UAV_SLOT(3)   // {hc, hc, n_tokens}
 
 cbuffer Params : register(b0) {
     uint offset_m;

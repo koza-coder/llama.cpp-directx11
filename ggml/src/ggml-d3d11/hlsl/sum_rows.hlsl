@@ -3,8 +3,8 @@
 // SUM_ROWS (f32): dst[0, i1, i2, i3] = sum of the row, one workgroup per row
 // With MEAN defined the same kernel divides by the row length, which is ggml's MEAN op.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

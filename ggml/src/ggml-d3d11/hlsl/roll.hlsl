@@ -4,8 +4,8 @@
 // with s = wrap(-s0, ne00). wrap matches ggml_wrap_index: a single period adjustment, not a modulo,
 // so an out-of-range shift behaves exactly as it does on the CPU.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;

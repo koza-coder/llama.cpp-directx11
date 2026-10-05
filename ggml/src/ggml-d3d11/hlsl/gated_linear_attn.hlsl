@@ -8,12 +8,12 @@
 // Same decomposition as rwkv_wkv6.hlsl: one thread per (sequence, head, column j) of the head's
 // state matrix. All tensors are contiguous; dst holds C*T outputs followed by the states.
 
-RWByteAddressBuffer k_buf : register(u0);   // {head_size, HEADS, T}
-RWByteAddressBuffer v_buf : register(u1);
-RWByteAddressBuffer q_buf : register(u2);
-RWByteAddressBuffer g_buf : register(u3);
-RWByteAddressBuffer s_buf : register(u4);   // incoming state {head_size*C, n_seqs}
-RWByteAddressBuffer dst   : register(u5);
+#define k_buf  UAV_SLOT(0)   // {head_size, HEADS, T}
+#define v_buf  UAV_SLOT(1)
+#define q_buf  UAV_SLOT(2)
+#define g_buf  UAV_SLOT(3)
+#define s_buf  UAV_SLOT(4)   // incoming state {head_size*C, n_seqs}
+#define dst    UAV_SLOT(5)
 
 cbuffer Params : register(b0) {
     uint offset_k;

@@ -6,9 +6,9 @@
 // is short (it has one entry per row that the forward GET_ROWS picked).
 // The index list is read flat, exactly as ggml_compute_forward_get_rows_back_f32 reads it.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer idx : register(u1);
-RWByteAddressBuffer dst : register(u2);
+#define src  UAV_SLOT(0)
+#define idx  UAV_SLOT(1)
+#define dst  UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_src;

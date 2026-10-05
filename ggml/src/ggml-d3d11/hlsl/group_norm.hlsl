@@ -5,8 +5,8 @@
 // makes three passes: mean, then centre-and-variance, then scale. That is the order the CPU uses,
 // including writing the centred value out before scaling it in place.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint  offset_src;

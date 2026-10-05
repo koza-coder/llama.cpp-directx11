@@ -5,9 +5,9 @@
 // where w is either a per (stream, token) weight or, when gated, sigmoid of a per element gate.
 // One thread per destination element. defines: GATED
 
-RWByteAddressBuffer x_buf : register(u0);
-RWByteAddressBuffer w_buf : register(u1);
-RWByteAddressBuffer dst   : register(u2);
+#define x_buf  UAV_SLOT(0)
+#define w_buf  UAV_SLOT(1)
+#define dst    UAV_SLOT(2)
 
 cbuffer Params : register(b0) {
     uint offset_x;

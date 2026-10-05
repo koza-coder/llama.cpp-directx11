@@ -12,13 +12,13 @@
 //
 // All tensors are contiguous; dst holds C*T outputs followed by the per-sequence states.
 
-RWByteAddressBuffer k_buf : register(u0);   // {head_size, HEADS, T}
-RWByteAddressBuffer v_buf : register(u1);   // {head_size, HEADS, T}
-RWByteAddressBuffer r_buf : register(u2);   // {head_size, HEADS, T}
-RWByteAddressBuffer tf_buf : register(u3);  // time_faaaa {head_size, HEADS}
-RWByteAddressBuffer td_buf : register(u4);  // time_decay {head_size, HEADS, T}
-RWByteAddressBuffer s_buf : register(u5);   // incoming state {head_size*C, n_seqs}
-RWByteAddressBuffer dst   : register(u6);
+#define k_buf  UAV_SLOT(0)   // {head_size, HEADS, T}
+#define v_buf  UAV_SLOT(1)   // {head_size, HEADS, T}
+#define r_buf  UAV_SLOT(2)   // {head_size, HEADS, T}
+#define tf_buf  UAV_SLOT(3)  // time_faaaa {head_size, HEADS}
+#define td_buf  UAV_SLOT(4)  // time_decay {head_size, HEADS, T}
+#define s_buf  UAV_SLOT(5)   // incoming state {head_size*C, n_seqs}
+#define dst    UAV_SLOT(6)
 
 cbuffer Params : register(b0) {
     uint offset_k;

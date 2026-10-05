@@ -4,8 +4,8 @@
 // The CPU reference accumulates in double; this accumulates in float, but the group tree keeps
 // the error close to pairwise summation rather than a serial walk.
 
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+#define src  UAV_SLOT(0)
+#define dst  UAV_SLOT(1)
 
 cbuffer Params : register(b0) {
     uint offset_src;
