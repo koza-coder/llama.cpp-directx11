@@ -33,6 +33,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -654,6 +655,41 @@ static std::vector<std::string> ggml_d3d11_compile_args(const std::vector<std::s
     return args;
 }
 
+// FXC needs a few hundred MB per big shader; with one compile per hardware thread the peak can pass 4 GB and D3DCompile
+// returns E_OUTOFMEMORY ("out of memory during compilation"). At most `permits` compiles run at once (GGML_D3D11_COMPILE_THREADS
+// overrides, default min(hardware threads, 3)); a compile that still runs out of memory is retried alone, with every permit held.
+struct d3d11_compile_gate {
+    std::mutex              m;
+    std::condition_variable cv;
+    int                     free_permits = 0;
+    int                     permits      = 0;
+    void init() {
+        std::lock_guard<std::mutex> lock(m);
+        if (permits == 0) {
+            permits = (int) std::min(3u, std::max(1u, std::thread::hardware_concurrency()));
+            if (const char * e = getenv("GGML_D3D11_COMPILE_THREADS")) {
+                permits = std::max(1, atoi(e));
+            }
+            free_permits = permits;
+        }
+    }
+    void acquire(int n) {
+        init();
+        n = std::min(n, permits);
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return free_permits >= n; });
+        free_permits -= n;
+    }
+    void release(int n) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            free_permits += std::min(n, permits);
+        }
+        cv.notify_all();
+    }
+};
+static d3d11_compile_gate g_compile_gate;
+
 // returns the DXBC from the disk cache, or compiles it with FXC and caches it; thread safe
 static std::vector<uint8_t> ggml_d3d11_get_dxbc(const std::string &              key,
                                                 const char *                     source,
@@ -679,8 +715,19 @@ static std::vector<uint8_t> ggml_d3d11_get_dxbc(const std::string &             
     macros.push_back({ nullptr, nullptr });
 
     com_ptr<ID3DBlob> code, errors;
+    g_compile_gate.acquire(1);
     HRESULT hr = D3DCompile(source, strlen(source), key.c_str(), macros.data(), nullptr, "main", "cs_5_0",
                             flags, 0, code.put(), errors.put());
+    g_compile_gate.release(1);
+    for (int attempt = 0; hr == E_OUTOFMEMORY && attempt < 2; attempt++) {
+        // out of memory: run this compile alone (all permits), after the other compiles have finished
+        code.reset();
+        errors.reset();
+        g_compile_gate.acquire(1 << 20);
+        hr = D3DCompile(source, strlen(source), key.c_str(), macros.data(), nullptr, "main", "cs_5_0",
+                        flags, 0, code.put(), errors.put());
+        g_compile_gate.release(1 << 20);
+    }
     if (FAILED(hr)) {
         GGML_LOG_ERROR("ggml_d3d11: shader compilation failed for %s:\n%s\n", key.c_str(),
                        errors ? (const char *) errors->GetBufferPointer() : "(no output)");
@@ -2967,21 +3014,31 @@ static void ggml_d3d11_soft_max(d3d11_device_ctx & dev, ggml_tensor * src0, ggml
 }
 
 static void ggml_d3d11_concat(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
-    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "concat", hlsl_concat, {});
+    // element sizes other than 4 bytes use an ELEMn variant: strides and offsets in units of the element size
+    const uint32_t esz  = (uint32_t) ggml_type_size(dst->type);
+    const int64_t  blck = ggml_blck_size(dst->type);   // > 1: quantised, one element is one block of esz bytes
+    std::vector<std::string> defs;
+    if (blck > 1) {
+        defs.push_back("ELEMBLK=" + std::to_string(esz));
+    } else if (esz != 4) {
+        defs.push_back("ELEM" + std::to_string(esz * 8));
+    }
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, esz == 4 && blck == 1 ? "concat" : ((blck > 1 ? "concat_b" : "concat_e") + std::to_string(blck > 1 ? esz : esz * 8)).c_str(),
+                                                        hlsl_concat, defs);
 
     const d3d11_binding b0  = ggml_d3d11_bind_tensor(src0);
     const d3d11_binding b1  = ggml_d3d11_bind_tensor(src1);
     const d3d11_binding bd  = ggml_d3d11_bind_tensor(dst);
     const int32_t       dim = ggml_get_op_params_i32(dst, 0);
-    const uint32_t      ne  = (uint32_t) ggml_nelements(dst);
+    const uint32_t      ne  = (uint32_t) (ggml_nelements(dst) / blck);
 
     const std::vector<uint32_t> params = {
-        b0.elem_offset, b1.elem_offset, bd.elem_offset,
-        (uint32_t) (src0->nb[0] / 4), (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
-        (uint32_t) (src1->nb[0] / 4), (uint32_t) (src1->nb[1] / 4), (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
-        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
-        ne, (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
-        (uint32_t) dim, (uint32_t) src0->ne[dim],
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,   // already in elements of the tensor type
+        (uint32_t) (src0->nb[0] / esz), (uint32_t) (src0->nb[1] / esz), (uint32_t) (src0->nb[2] / esz), (uint32_t) (src0->nb[3] / esz),
+        (uint32_t) (src1->nb[0] / esz), (uint32_t) (src1->nb[1] / esz), (uint32_t) (src1->nb[2] / esz), (uint32_t) (src1->nb[3] / esz),
+        (uint32_t) (dst->nb[0] / esz), (uint32_t) (dst->nb[1] / esz), (uint32_t) (dst->nb[2] / esz), (uint32_t) (dst->nb[3] / esz),
+        ne, (uint32_t) (dst->ne[0] / blck), (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) dim, (uint32_t) (src0->ne[dim] / (dim == 0 ? blck : 1)),
     };
     ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
@@ -4409,7 +4466,10 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
                 return ok;
             }
         case GGML_OP_CONCAT:
-            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32) && src0->type == op->type &&
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                    op->type == GGML_TYPE_I8 || op->type == GGML_TYPE_I16 || op->type == GGML_TYPE_I64 ||
+                    op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 || op->type == GGML_TYPE_Q5_1 ||
+                    op->type == GGML_TYPE_Q8_0) && src0->type == op->type &&
                    src1->type == op->type && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -4466,6 +4526,7 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
             switch (src0->type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
                     return op->type == GGML_TYPE_F32;
                 case GGML_TYPE_I32:
                     return op->type == GGML_TYPE_I32;
