@@ -277,6 +277,44 @@ void dot_row(RWByteAddressBuffer wbuf, uint src0_base, uint lane, uint ncols, ui
         }
         acc[0] += d * ((float) sbyte_of(scw, 0) * sum0 + (float) sbyte_of(scw, 1) * sum1);
     }
+#elif defined(SRC0_Q5_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: header, qh and ql as Load4s (176-byte blocks are 16-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 176;
+        const uint4 hd   = wbuf.Load4(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const float dmin = f16tof32(hd.x >> 16);
+        uint sc, mn;
+        if (s < 4) {
+            sc = byte_of(hd.y, s) & 63u;
+            mn = byte_of(hd.z, s) & 63u;
+        } else {
+            sc = (byte_of(hd.w, s - 4) & 0xFu) | ((byte_of(hd.y, s - 4) >> 6) << 4);
+            mn = (byte_of(hd.w, s - 4) >> 4) | ((byte_of(hd.z, s - 4) >> 6) << 4);
+        }
+        const uint  shift = (s & 1u) * 4u;
+        const uint  qbase = base + 48 + 32 * (s / 2);
+        const uint4 q0    = wbuf.Load4(qbase);
+        const uint4 q1    = wbuf.Load4(qbase + 16);
+        const uint4 h0    = wbuf.Load4(base + 16);
+        const uint4 h1    = wbuf.Load4(base + 32);
+        const uint  Q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  H[8]  = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+        const uint  ys    = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sq = 0.0f, sy = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   q = (Q[j] >> shift) & 0x0F0F0F0Fu;
+            const uint   h = ((H[j] >> s) & 0x01010101u) << 4;   // bit s of each qh byte -> +16
+            const uint   v = q | h;
+            sq += (float) (v & 0xFFu) * y.x + (float) ((v >> 8) & 0xFFu) * y.y +
+                  (float) ((v >> 16) & 0xFFu) * y.z + (float) (v >> 24) * y.w;
+            sy += y.x + y.y + y.z + y.w;
+        }
+        acc[0] += d * (float) sc * sq - dmin * (float) mn * sy;
+    }
 #elif defined(SRC0_Q4_K)
     // super-block of 256: f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 128 bytes of nibbles.
     // sub-block s (32 values): pair s/2 uses bytes 16 + 32*(s/2), low nibbles for even s, high for odd s.
