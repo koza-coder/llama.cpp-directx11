@@ -1,11 +1,19 @@
 #include "common.hlsli"
 
-// COL2IM_1D (f32): scatter-add columns [K*OC, T_in] back to a signal [T_out, OC].
+// COL2IM_1D (f32, or f16 with -DCOL_F16 for both columns and signal): scatter-add columns [K*OC, T_in] back to a signal [T_out, OC].
 // The CPU already gathers rather than scatters, so this is a direct transcription: one thread owns
 // one output sample and sums the at most ceil(K/s) columns that overlap it.
 
 #define src  UAV_SLOT(0)   // [K*OC, T_in]
 #define dst  UAV_SLOT(1)   // [T_out, OC]
+
+#if defined(COL_F16)
+#define LOAD_COL(b, i)     LOAD_F16(b, i)
+#define STORE_COL(b, i, v) STORE_F16(b, i, v)
+#else
+#define LOAD_COL(b, i)     LOAD_F32(b, i)
+#define STORE_COL(b, i, v) STORE_F32(b, i, v)
+#endif
 
 cbuffer Params : register(b0) {
     uint offset_src;
@@ -44,8 +52,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     for (int c = lo; c <= hi; c++) {
         const int k = t_abs - c * s0;
         if (k >= 0 && k < (int) kk) {
-            sum += LOAD_F32(src, offset_src + (oc * kk + (uint) k) + (uint) c * k_oc);
+            sum += LOAD_COL(src, offset_src + (oc * kk + (uint) k) + (uint) c * k_oc);
         }
     }
-    STORE_F32(dst, offset_dst + i, sum);
+    STORE_COL(dst, offset_dst + i, sum);
 }
