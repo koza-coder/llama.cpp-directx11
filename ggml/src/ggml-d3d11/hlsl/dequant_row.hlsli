@@ -647,7 +647,7 @@ void dot_row(RWByteAddressBuffer wbuf, uint src0_base, uint lane, uint ncols, ui
             LOAD_U32_UNALIGNED(wbuf, base + 2 + 4 * s + l, q);
             const uint gi = (q & 0xFFu) | (((qh >> (3u * l)) & 7u) << 8);
             [unroll] for (uint j = 0; j < 8; j++) {
-                const int gv = j < 4 ? sbyte_of(IQ1S_GRID_LO[gi], j) : sbyte_of(IQ1S_GRID_HI[gi], j - 4);
+                const int gv = (int) ((IQ1S_PACK[gi >> 1] >> ((gi & 1u) * 16u + 2u * j)) & 3u) - 1;
                 ACC(dl * ((float) gv + delta), blk * 256 + s * 32 + l * 8 + j);
             }
         }
@@ -788,7 +788,7 @@ void dot_row(RWByteAddressBuffer wbuf, uint src0_base, uint lane, uint ncols, ui
             const float delta = (h & ((l & 1u) == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f : 0.125f;
             const float dl    = l < 2 ? dl1 : dl2;
             [unroll] for (uint j = 0; j < 8; j++) {
-                const int gv = j < 4 ? sbyte_of(IQ1S_GRID_LO[gi], j) : sbyte_of(IQ1S_GRID_HI[gi], j - 4);
+                const int gv = (int) ((IQ1S_PACK[gi >> 1] >> ((gi & 1u) * 16u + 2u * j)) & 3u) - 1;
                 ACC(dl * ((float) gv + delta), blk * 256 + s * 32 + l * 8 + j);
             }
         }
