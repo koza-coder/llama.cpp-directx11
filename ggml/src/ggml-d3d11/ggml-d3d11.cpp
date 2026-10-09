@@ -5032,9 +5032,11 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
         /* .iface = */ {
             /* .get_name       = */ ggml_backend_d3d11_buffer_type_get_name,
             /* .alloc_buffer   = */ ggml_backend_d3d11_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n = */ NULL,
             /* .get_alignment  = */ ggml_backend_d3d11_buffer_type_get_alignment,
             /* .get_max_size   = */ ggml_backend_d3d11_buffer_type_get_max_size,
             /* .get_alloc_size = */ NULL,
+            /* .get_alloc_size_n = */ NULL,
             /* .is_host        = */ NULL,
         },
         /* .device  = */ ggml_dev,
