@@ -47,6 +47,20 @@
 #endif
 
 // Below 16 columns the matvec kernel is as fast or faster (MTT S80 pp8 -9%, R9700 pp2 -27%, 2026-09-21)
+// rows of dst per tiled workgroup (TILE_M in mul_mat_tiled.hlsl; 64 or 128)
+#ifndef GGML_D3D11_TILE_M
+#define GGML_D3D11_TILE_M           128   // v0.3.0: 128 rows per tiled workgroup (exp353 and later all measured with 128); env-free, per-type override: Q6_K 64
+#endif
+// Q6_K runs faster with 64 rows per workgroup (exp327 vs exp338: 47.5 vs 48.4 t/s pp512 on Intel), every other type with GGML_D3D11_TILE_M
+static uint32_t ggml_d3d11_tile_m(ggml_type t) {
+    return t == GGML_TYPE_Q6_K ? 64u : (uint32_t) GGML_D3D11_TILE_M;
+}
+#ifndef GGML_D3D11_TILED_MMID_DEFAULT
+#define GGML_D3D11_TILED_MMID_DEFAULT 16   // exp358: MUL_MAT_ID tiled gate (tokens), separate from the dense MUL_MAT gate; env GGML_D3D11_TILED_MMID
+#endif
+#ifndef GGML_D3D11_MV_MULTI_DEFAULT
+#define GGML_D3D11_MV_MULTI_DEFAULT 1   // exp360: word-window mat-vec for 2..4 columns per dispatch (Q4_0, Q8_0); env GGML_D3D11_MV_MULTI
+#endif
 #ifndef GGML_D3D11_TILED_DEFAULT
 #define GGML_D3D11_TILED_DEFAULT    16
 #endif
@@ -263,6 +277,9 @@ struct d3d11_device_ctx {
     bool     no_fuse          = false;
     uint32_t mm_tpr_max       = D3D11_WG_SIZE;
     uint32_t tiled_min_cols   = GGML_D3D11_TILED_DEFAULT;
+    uint32_t tiled_mmid_min_cols = GGML_D3D11_TILED_MMID_DEFAULT;   // exp358
+    uint32_t tiled_type_cols[GGML_TYPE_COUNT] = {};   // exp365: dense tiled gate per weight type (device x type table in ggml_d3d11_init_device); 0 = tiled_min_cols
+    bool     mv_multi         = GGML_D3D11_MV_MULTI_DEFAULT != 0;   // exp360
     com_ptr<d3d11_res> mmid_scratch;
     size_t             mmid_scratch_size = 0;
     com_ptr<d3d11_res> topk_scratch;          // full sorted index rows of a long TOP_K, see ggml_d3d11_argsort
@@ -662,10 +679,14 @@ struct d3d11_compile_gate {
     std::condition_variable cv;
     int                     free_permits = 0;
     int                     permits      = 0;
+    int                     list_permits = 0;   // "#threads=N" line of shaders.txt (set before the first compile)
     void init() {
         std::lock_guard<std::mutex> lock(m);
         if (permits == 0) {
             permits = (int) std::min(3u, std::max(1u, std::thread::hardware_concurrency()));
+            if (list_permits > 0) {
+                permits = list_permits;
+            }
             if (const char * e = getenv("GGML_D3D11_COMPILE_THREADS")) {
                 permits = std::max(1, atoi(e));
             }
@@ -793,11 +814,20 @@ static void ggml_d3d11_prewarm() {
         return;
     }
     char buf[4096];
+    bool wait_all = false;   // "#wait" line: compile the missing shaders before the device init returns (cache-fill runs)
     while (fgets(buf, sizeof(buf), f)) {
         std::vector<std::string> fields;
         std::string              line = buf;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
             line.pop_back();
+        }
+        if (line == "#wait") {
+            wait_all = true;
+            continue;
+        }
+        if (line.compare(0, 9, "#threads=") == 0) {
+            g_compile_gate.list_permits = std::max(1, atoi(line.c_str() + 9));
+            continue;
         }
         for (size_t pos = 0; pos <= line.size();) {
             const size_t tab = std::min(line.find('\t', pos), line.size());
@@ -832,15 +862,26 @@ static void ggml_d3d11_prewarm() {
     GGML_LOG_INFO("ggml_d3d11: compiling %zu listed shaders on %zu threads in the background\n", missing.size(), n_threads);
     auto shared = std::make_shared<std::vector<item>>(std::move(missing));
     auto next   = std::make_shared<std::atomic<size_t>>(0);
+    std::vector<std::thread> workers;
     for (size_t t = 0; t < n_threads; t++) {
-        std::thread([shared, next]() {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        std::thread th([shared, next, wait_all]() {
+            if (!wait_all) {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
             for (size_t i; (i = (*next)++) < shared->size();) {
                 const item & it = (*shared)[i];
                 std::wstring cf;
                 ggml_d3d11_get_dxbc(it.key, it.source, it.defines, cf);
             }
-        }).detach();
+        });
+        if (wait_all) {
+            workers.push_back(std::move(th));
+        } else {
+            th.detach();
+        }
+    }
+    for (auto & w : workers) {
+        w.join();
     }
 }
 
@@ -1500,7 +1541,9 @@ static bool ggml_d3d11_tiled_type(ggml_type t) {
 // handful of columns the matvec kernel wins, because a tile of 32 columns would be mostly padding.
 static bool ggml_d3d11_use_tiled(const d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                  ggml_tensor * dst) {
-    return dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols &&
+    const uint32_t t_cols = (uint32_t) src0->type < (uint32_t) GGML_TYPE_COUNT ? dev.tiled_type_cols[src0->type] : 0;   // exp365
+    const uint32_t gate   = t_cols != 0 ? t_cols : dev.tiled_min_cols;
+    return gate != 0 && (uint32_t) dst->ne[1] >= gate &&
            ggml_d3d11_tiled_type(src0->type) && src0->ne[0] % 32 == 0 &&
            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
 }
@@ -1516,6 +1559,9 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
     std::vector<std::string> defines = { define };
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
+    }
+    if (ggml_d3d11_tile_m(src0->type) != 64) {
+        defines.push_back("TILE_M=" + std::to_string(ggml_d3d11_tile_m(src0->type)));
     }
     d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
 
@@ -1538,7 +1584,7 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
     };
 
     // tile sizes must match TILE_M and TILE_N in mul_mat_tiled.hlsl
-    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], 64u);
+    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], ggml_d3d11_tile_m(src0->type));
     const uint32_t tiles_n  = CEIL_DIV((uint32_t) dst->ne[1], 32u);
     const uint32_t batches  = (uint32_t) (dst->ne[2] * dst->ne[3]);
     ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va }, tiles_m * tiles_n * batches);
@@ -1607,9 +1653,16 @@ static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1,
     // deterministic) while F16 and the quant types passed the same shape; cause not found yet.
     const bool     one_col  = mats[0].dst->ne[1] == 1 && src0->type != GGML_TYPE_F32;
     const uint32_t max_cols = one_col ? 1 : 4;
+    // exp360: 2..4 columns with the word-window kernels (each weight word decoded once, FMA into up to 4 columns)
+    const bool multi_col = dev.mv_multi && !one_col && mats[0].dst->ne[1] > 1 &&
+                           (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
+                           src0->ne[0] % 32 == 0 && src1->type == GGML_TYPE_F32;
     std::vector<std::string> defines = { define, "TPR=" + std::to_string(tpr), "N_MATS=" + std::to_string(mats.size()) };
-    if (one_col) {
+    if (one_col || multi_col) {
         defines.push_back("ONE_COL");
+    }
+    if (multi_col) {
+        defines.push_back("MULTI_COL");
     }
     // On the AMD Vega iGPU every N_MATS=2 kernel without FUSE_ADD hung the GPU (DEVICE_HUNG, 2026-09-19); taking
     // the FUSE_ADD variant for groups (add_flag 0 skips the add at run time) avoids it. Why the variant matters is
@@ -1680,7 +1733,7 @@ static bool ggml_d3d11_mul_mat_id_tiled(d3d11_device_ctx & dev, ggml_tensor * as
     const uint32_t n_tokens  = (uint32_t) ids->ne[1];
     const uint32_t n_experts = (uint32_t) as->ne[2];
     // MAX_EXPERTS in mul_mat_id_prep.hlsl
-    if (dev.tiled_min_cols == 0 || n_tokens < dev.tiled_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
+    if (dev.tiled_mmid_min_cols == 0 || n_tokens < dev.tiled_mmid_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
         !ggml_d3d11_tiled_type(as->type) || as->ne[0] % 32 != 0 || src1->type != GGML_TYPE_F32 ||
         dst->nb[0] != sizeof(float)) {
         return false;
@@ -1710,7 +1763,7 @@ static bool ggml_d3d11_mul_mat_id_tiled(d3d11_device_ctx & dev, ggml_tensor * as
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, { define, "MMID" });
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, ggml_d3d11_tile_m(as->type) != 64 ? std::vector<std::string>{ define, "MMID", "TILE_M=" + std::to_string(ggml_d3d11_tile_m(as->type)) } : std::vector<std::string>{ define, "MMID" });
 
     const d3d11_binding b0 = ggml_d3d11_bind_tensor(as);
     const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
@@ -1726,7 +1779,7 @@ static bool ggml_d3d11_mul_mat_id_tiled(d3d11_device_ctx & dev, ggml_tensor * as
         n_used, (uint32_t) src1->ne[1], (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), list_base,
     };
     // TILE_M in mul_mat_tiled.hlsl; workgroups past the real tile count do nothing
-    const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], 64u);
+    const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], ggml_d3d11_tile_m(as->type));
     ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va, scratch_va }, tiles_m * max_tiles);
     return true;
 }
@@ -4970,6 +5023,26 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
     }
     if (const char * env = getenv("GGML_D3D11_TILED")) {
         dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
+        dev.tiled_mmid_min_cols = dev.tiled_min_cols;   // as before exp358: GGML_D3D11_TILED sets both gates
+    }
+    if (const char * env = getenv("GGML_D3D11_MV_MULTI")) {
+        dev.mv_multi = atoi(env) != 0;
+    }
+    // exp365: dense tiled gate per device x weight type (exp353/358/360 llama-bench sweeps, n = columns). GGML_D3D11_TILED (any value)
+    // switches the table off and sets one gate for every type as before.
+    // Intel Iris Xe: tiled wins from 5 columns for Q4_0, Q8_0, Q4_K, Q6_K (exp360: tiled 5-17x faster than the multi-column mat-vec from n=5).
+    // AMD (R9700): Q6_K wins from 5 (x3.6-6.9); Q4_0 / Q8_0 are even with the multi-column mat-vec below 16, Q4_K loses below 16: default gate.
+    if (getenv("GGML_D3D11_TILED") == nullptr) {
+        if (dev.vendor_id == 0x8086) {
+            for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+                dev.tiled_type_cols[t] = 5;
+            }
+        } else if (dev.vendor_id == 0x1002) {
+            dev.tiled_type_cols[GGML_TYPE_Q6_K] = 5;
+        }
+    }
+    if (const char * env = getenv("GGML_D3D11_TILED_MMID")) {
+        dev.tiled_mmid_min_cols = (uint32_t) std::max(0, atoi(env));
     }
     const char * disable_ops = getenv("GGML_D3D11_DISABLE_OPS") ? getenv("GGML_D3D11_DISABLE_OPS") : getenv("GGML_D3D12_DISABLE_OPS");
     if (const char * env = disable_ops) {
