@@ -5,9 +5,10 @@
 > ROCm support.
 >
 > - **Download:** Windows x64 zips on the [releases page](https://github.com/koza-coder/llama.cpp-directx11/releases)
-> - **Tested** with Qwen2.5-0.5B Q4_0, perplexity 17.29 on both:
->   - AMD Radeon AI PRO R9700: prompt 6910 tok/s, generation 95.6 tok/s
->   - Moore Threads MTT S80: prompt 1244 tok/s, generation 17.6 tok/s
+> - **Tested** (v0.3.0 zip) with Qwen2.5-0.5B Q4_0, perplexity 17.29 on both:
+>   - AMD Radeon AI PRO R9700: prompt pp512 8009 tok/s, generation tg64 142 tok/s
+>   - Moore Threads MTT S80: prompt pp512 1077 tok/s, generation tg64 50.0 tok/s
+> - **Build, test, settings:** [README-D3D11.md](README-D3D11.md)
 > - **Backend source:** [ggml/src/ggml-d3d11](ggml/src/ggml-d3d11)
 > - **Other versions:** [DirectX 12](https://github.com/koza-coder/llama.cpp-directx12) (first choice on current GPUs,
 >   faster generation), [OpenGL](https://github.com/koza-coder/llama.cpp-opengl) - same llama.cpp, only the GPU
