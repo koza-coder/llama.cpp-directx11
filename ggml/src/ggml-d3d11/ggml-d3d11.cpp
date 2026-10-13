@@ -9,6 +9,7 @@
 #include "ggml-d3d11.h"
 
 #include "ggml-backend-impl.h"
+#include "ggml-alloc.h"
 #include "ggml-impl.h"
 
 #include "ggml-d3d11-shaders.hpp"
@@ -38,6 +39,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef GGML_D3D11_DEBUG
@@ -229,6 +231,8 @@ struct d3d11_device_ctx {
     std::unordered_map<uint64_t, uint64_t> bind_end;   // start -> end of the tensors bound for the next dispatch
     // outputs of the nodes being encoded: a dispatch at node i can only write nodes i and after (fused ones)
     const ggml_tensor *                    out_nodes[8] = {};
+    std::unordered_set<uint64_t>           prefetch_sigs;   // exp398: shape signatures of graphs already collected
+    std::unordered_set<uint64_t>           compute_sigs;    // exp401: same for graph_compute
     com_ptr<d3d11_res> alias_copy[D3D11_MAX_ROOT_UAVS];   // per slot: copy of a slot that shares a buffer
 
     // staging for set/get tensor
@@ -325,6 +329,10 @@ struct ggml_backend_d3d11_buffer_context {
     com_ptr<d3d11_res>                res;
     D3D11_GPU_VIRTUAL_ADDRESS         va = 0;
     size_t                            size = 0;
+    // exp396: a weight over the single-buffer limit lives in several resources; parts[i] holds the logical bytes
+    // [i * part_stride, (i + 1) * part_stride) (whole rows). Empty for every ordinary buffer.
+    std::vector<com_ptr<d3d11_res>>   parts;
+    size_t                            part_stride = 0;
 };
 
 struct ggml_backend_d3d11_context {
@@ -683,7 +691,9 @@ struct d3d11_compile_gate {
     void init() {
         std::lock_guard<std::mutex> lock(m);
         if (permits == 0) {
-            permits = (int) std::min(3u, std::max(1u, std::thread::hardware_concurrency()));
+            // exp388: 8 (v0.3.0: 3); user 2026-10-13 "compile them 8 at a time". A compile that runs out of memory is
+            // still retried alone with every permit held (see below), so a high value costs time, not correctness.
+            permits = (int) std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
             if (list_permits > 0) {
                 permits = list_permits;
             }
@@ -1004,21 +1014,75 @@ struct d3d11_binding {
     uint32_t                  elem_offset;   // misalignment in elements, passed to the kernel
 };
 
+/* exp396: segmented weights (one 2D weight over 512 MiB held as several D3D11 resources) */
+#define D3D11_SEG_PART_BYTES (384ull << 20)
+#define D3D11_SEG_MAX_BYTES  (3ull << 30)
+
+static bool ggml_d3d11_is_d3d11_buffer(const ggml_tensor * t);
+
+// a weight that may be held in segments: plain 2D, contiguous rows, over the single-buffer limit, rows well below one part
+static bool ggml_d3d11_seg_weight(const ggml_tensor * t) {
+    return t != nullptr && t->view_src == nullptr && t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == ggml_type_size(t->type) &&
+           t->nb[1] == ggml_row_size(t->type, t->ne[0]) && t->nb[1] <= (4ull << 20) &&
+           ggml_nbytes(t) > D3D11_MAX_BUFFER_BYTES + 256 && ggml_nbytes(t) <= D3D11_SEG_MAX_BYTES;
+}
+
+static const ggml_backend_d3d11_buffer_context * ggml_d3d11_seg_ctx(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr || !ggml_d3d11_is_d3d11_buffer(t)) {
+        return nullptr;
+    }
+    auto * c = (const ggml_backend_d3d11_buffer_context *) t->buffer->context;
+    return c->parts.empty() ? nullptr : c;
+}
+
+// true when the tensor lives in a segmented buffer and its bytes are not inside one part
+static bool ggml_d3d11_seg_spans(const ggml_tensor * t) {
+    const ggml_backend_d3d11_buffer_context * c = ggml_d3d11_seg_ctx(t);
+    if (c == nullptr || ggml_nbytes(t) == 0) {
+        return false;
+    }
+    const size_t off = ggml_d3d11_tensor_offset(t);
+    return off / c->part_stride != (off + ggml_nbytes(t) - 1) / c->part_stride;
+}
+
+// MUL_MAT with a segmented (or still unplaced) weight as src0, one dst per column set: the only op allowed over the limit
+static bool ggml_d3d11_seg_mul_mat_ok(const ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    return ggml_d3d11_seg_weight(w) && (w->data == nullptr || ggml_d3d11_seg_ctx(w) != nullptr) &&   // data == nullptr: the loader's probe (zero-size buffer)
+           b->type == GGML_TYPE_F32 && b->ne[2] == 1 && b->ne[3] == 1 && b->nb[0] == sizeof(float) && op->type == GGML_TYPE_F32 &&
+           op->ne[2] == 1 && op->ne[3] == 1 && ggml_is_contiguous(op);
+}
+
 static D3D11_GPU_VIRTUAL_ADDRESS ggml_d3d11_tensor_va(const ggml_tensor * t) {
     auto * buf_ctx = (ggml_backend_d3d11_buffer_context *) t->buffer->context;
+    GGML_ASSERT(buf_ctx->parts.empty());   // a segmented weight is only bound through ggml_d3d11_bind_tensor
     return buf_ctx->va;
 }
 
 // Bind at the largest 256-byte aligned offset at or before the tensor such that the distance is a
 // whole number of type blocks, so the kernel can index the remainder in elements.
 static d3d11_binding ggml_d3d11_bind_tensor(const ggml_tensor * t) {
-    const size_t offset    = ggml_d3d11_tensor_offset(t);
+    size_t       offset    = ggml_d3d11_tensor_offset(t);
     const size_t type_size = ggml_type_size(t->type);
-    size_t       aligned   = offset & ~((size_t) D3D11_BINDING_ALIGNMENT - 1);
+    auto *       bctx      = (ggml_backend_d3d11_buffer_context *) t->buffer->context;
+    // exp396: in a segmented buffer the tensor (or the row chunk the caller made of it) is inside one part; bind in that part
+    D3D11_GPU_VIRTUAL_ADDRESS base_va  = bctx->va;
+    size_t                    buf_size = bctx->size;
+    if (!bctx->parts.empty()) {
+        const size_t pi = offset / bctx->part_stride;
+        GGML_ASSERT(pi < bctx->parts.size() && (offset + ggml_nbytes(t) - 1) / bctx->part_stride == pi);
+        base_va  = bctx->parts[pi]->GetGPUVirtualAddress();
+        buf_size = bctx->parts[pi]->size;
+        offset  -= pi * bctx->part_stride;
+    }
+    size_t aligned = offset & ~((size_t) D3D11_BINDING_ALIGNMENT - 1);
     // In a buffer that fits one raw view, bind from the buffer start: all its tensors then share one view, so a
     // dispatch that reads and writes one buffer needs no copy (slot aliasing, see ggml_d3d11_dispatch)
-    auto * bctx = (ggml_backend_d3d11_buffer_context *) t->buffer->context;
-    if (bctx->size <= D3D11_MAX_BUFFER_BYTES && offset % type_size == 0 && offset / type_size <= UINT32_MAX) {
+    if (buf_size <= D3D11_MAX_BUFFER_BYTES && offset % type_size == 0 && offset / type_size <= UINT32_MAX) {
         aligned = 0;
     }
     while ((offset - aligned) % type_size != 0) {
@@ -1026,12 +1090,11 @@ static d3d11_binding ggml_d3d11_bind_tensor(const ggml_tensor * t) {
         aligned -= D3D11_BINDING_ALIGNMENT;
     }
     d3d11_binding b;
-    b.va          = ggml_d3d11_tensor_va(t) + aligned;
+    b.va          = base_va + aligned;
     b.elem_offset = (uint32_t) ((offset - aligned) / type_size);
     // D3D11 refuses overlapping UAVs of one buffer, so each view covers only its tensor
-    auto *         buf_ctx = (ggml_backend_d3d11_buffer_context *) t->buffer->context;
-    const uint64_t end     = std::min<uint64_t>(ggml_d3d11_tensor_va(t) + ((offset + ggml_nbytes(t) + 3) & ~(size_t) 3),
-                                                buf_ctx->va + buf_ctx->size);
+    auto *         buf_ctx = bctx;
+    const uint64_t end     = std::min<uint64_t>(base_va + ((offset + ggml_nbytes(t) + 3) & ~(size_t) 3), base_va + buf_size);
     uint64_t &     e       = buf_ctx->dev->bind_end[b.va];
     e = std::max(e, end);
     // a written tensor (a node output) is tagged in the address, so the dispatch knows the written slot
@@ -1619,9 +1682,15 @@ static void ggml_d3d11_mul_mat_scalar(d3d11_device_ctx & dev, ggml_tensor * src0
     ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
+static void ggml_d3d11_mul_mat_segmented(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst);
+
 static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1, const std::vector<d3d11_mat_slot> & mats) {
     GGML_ASSERT(!mats.empty() && mats.size() <= 3);
     ggml_tensor * src0 = mats[0].src0;
+    if (mats.size() == 1 && mats[0].add == nullptr && ggml_d3d11_seg_spans(src0)) {
+        ggml_d3d11_mul_mat_segmented(dev, src0, src1, mats[0].dst);
+        return;
+    }
     if (ggml_d3d11_mul_mat_scalar_needed(src0)) {
         GGML_ASSERT(mats.size() == 1 && mats[0].add == nullptr);
         ggml_d3d11_mul_mat_scalar(dev, src0, src1, mats[0].dst);
@@ -1865,6 +1934,51 @@ static void ggml_d3d11_mul_mat(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_
     ggml_d3d11_mul_mat_group(dev, src1, { { src0, dst, nullptr } });
 }
 
+// exp396: dst = src0 * src1 with src0 held in several parts. One mat-vec per part and column: src0 = the rows of one part,
+// src1 = column c, dst = the matching slice of dst column c (contiguous: dst is [rows, cols] column-major). The views are
+// plain tensors inside one part, so the ordinary one-column kernel runs unchanged (no shader edit, shader cache stays valid).
+static void ggml_d3d11_mul_mat_segmented(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    const ggml_backend_d3d11_buffer_context * c = ggml_d3d11_seg_ctx(src0);
+    GGML_ASSERT(c != nullptr && src0->nb[1] > 0 && src0->ne[2] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[2] == 1);
+    const size_t rb   = src0->nb[1];
+    const size_t rpp  = c->part_stride / rb;          // rows per part
+    const size_t rows = (size_t) src0->ne[1];
+    const char * base = (const char *) d3d11_ptr_base;
+    const size_t off0 = ggml_d3d11_tensor_offset(src0);
+    const size_t off1 = ggml_d3d11_tensor_offset(src1);
+    const size_t offd = ggml_d3d11_tensor_offset(dst);
+    const ggml_tensor * saved_out[8];
+    std::copy(std::begin(dev.out_nodes), std::end(dev.out_nodes), saved_out);
+    for (size_t r0 = 0; r0 < rows; r0 += rpp) {
+        const size_t nr = std::min(rpp, rows - r0);
+        ggml_tensor s0  = *src0;
+        s0.ne[1]        = (int64_t) nr;
+        s0.nb[2]        = s0.nb[3] = rb * nr;
+        s0.data         = (void *) (base + off0 + r0 * rb);
+        s0.view_src     = nullptr;
+        s0.view_offs    = 0;
+        for (int64_t col = 0; col < src1->ne[1]; col++) {
+            ggml_tensor s1 = *src1;
+            s1.ne[1]       = 1;
+            s1.nb[2]       = s1.nb[3] = src1->nb[1];
+            s1.data        = (void *) (base + off1 + (size_t) col * src1->nb[1]);
+            s1.view_src    = nullptr;
+            s1.view_offs   = 0;
+            ggml_tensor d  = *dst;
+            d.ne[0]        = (int64_t) nr;
+            d.ne[1]        = 1;
+            d.nb[1]        = d.nb[2] = d.nb[3] = nr * sizeof(float);
+            d.data         = (void *) (base + offd + ((size_t) col * dst->ne[0] + r0) * sizeof(float));
+            d.view_src     = nullptr;
+            d.view_offs    = 0;
+            std::fill(std::begin(dev.out_nodes), std::end(dev.out_nodes), nullptr);
+            dev.out_nodes[0] = &d;   // the written slot is tagged by tensor identity
+            ggml_d3d11_mul_mat_group(dev, &s1, { { &s0, &d, nullptr } });
+        }
+    }
+    std::copy(std::begin(saved_out), std::end(saved_out), dev.out_nodes);
+}
+
 // can `add_node` (an ADD consuming `mm`) be folded into the matvec that produces `mm`? returns the addend
 static ggml_tensor * ggml_d3d11_fusable_addend(const ggml_tensor * mm, const ggml_tensor * add_node) {
     if (add_node->src[0] != mm && add_node->src[1] != mm) {
@@ -1894,6 +2008,10 @@ static ggml_tensor * ggml_d3d11_fusable_addend(const ggml_tensor * mm, const ggm
 static int ggml_d3d11_encode_mul_mat_group(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * first = cgraph->nodes[i];
     ggml_tensor * src1  = first->src[1];
+    if (ggml_d3d11_seg_spans(first->src[0])) {
+        ggml_d3d11_mul_mat(dev, first->src[0], src1, first);   // exp396: row-chunked, no tiled kernel, no fusion
+        return 1;
+    }
     if (ggml_d3d11_mul_mat_scalar_needed(first->src[0])) {
         ggml_d3d11_mul_mat(dev, first->src[0], src1, first);
         return 1;
@@ -4133,6 +4251,34 @@ static void ggml_backend_d3d11_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// exp401: shape signature of a graph: everything that can select another pipeline variant (op, types, extents, strides of the
+// dst and the first two sources, the first op params); over-inclusion only costs one more collecting pass
+static uint64_t ggml_d3d11_graph_signature(const ggml_cgraph * cgraph) {
+    uint64_t sig = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix((uint64_t) n->op | ((uint64_t) n->type << 16) | ((uint64_t) ggml_is_empty(n) << 32));
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            mix((uint64_t) n->ne[d]);
+        }
+        mix((uint64_t) n->nb[1]);
+        for (int k = 0; k < 4; k++) {
+            mix((uint64_t) (uint32_t) n->op_params[k]);
+        }
+        for (int s = 0; s < 2; s++) {
+            const ggml_tensor * x = n->src[s];
+            if (x != nullptr) {
+                mix((uint64_t) x->type | ((uint64_t) x->ne[0] << 8) | ((uint64_t) x->ne[1] << 40));
+                mix((uint64_t) x->ne[2] * 31 + (uint64_t) x->ne[3]);
+                mix((uint64_t) x->nb[0] * 131 + (uint64_t) x->nb[1]);
+            }
+        }
+    }
+    return sig;
+}
+
 static ggml_status ggml_backend_d3d11_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto *             ctx = (ggml_backend_d3d11_context *) backend->context;
     d3d11_device_ctx & dev = *ctx->dev;
@@ -4142,8 +4288,8 @@ static ggml_status ggml_backend_d3d11_graph_compute(ggml_backend_t backend, stru
     const double t0 = ggml_d3d11_time_us();
     const double submit0 = dev.t_submit_us, wait0 = dev.t_wait_us;
     ggml_d3d11_begin(dev, true);
-    if (dev.n_graphs < 4 || cgraph->n_nodes != dev.last_graph_nodes) {
-        // a graph of a new shape: find the pipelines it needs first and compile the missing ones in parallel
+    if (dev.compute_sigs.insert(ggml_d3d11_graph_signature(cgraph)).second || dev.n_graphs < 4) {
+        // a graph of a new shape (exp401: signature, not node count): find the pipelines it needs first and compile the missing ones in parallel
         dev.collecting = true;
         for (int i = 0; i < cgraph->n_nodes;) {
             i += ggml_d3d11_encode_nodes(dev, cgraph, i);
@@ -4164,6 +4310,136 @@ static ggml_status ggml_backend_d3d11_graph_compute(ggml_backend_t backend, stru
     return GGML_STATUS_SUCCESS;
 }
 
+
+/* exp388: load-time shader exploration (user idea 2026-10-13: "during loading the new model start the full graph exploration,
+ * mark all missing shaders, compile them N at a time so N threads are used, not 1").
+ * llama.cpp's scheduler splits the worst-case pp and tg graphs while the llama_context is created and calls graph_optimize for
+ * every split, before any graph_compute. The tensors of such a graph have no d3d11 buffer (intermediates: none; split inputs:
+ * another backend's buffer), so for this pass they get a temporary dummy buffer, the collecting pass runs (dispatches are
+ * no-ops while collecting), the tensors are restored, and every missing pipeline is built in ONE parallel batch.
+ * GGML_D3D11_NO_PREFETCH=1 turns it off. The graph itself is not changed. */
+static void ggml_backend_d3d11_buffer_free_buffer(ggml_backend_buffer_t buffer);
+
+struct d3d11_prefetch_saved {
+    ggml_tensor *          t;
+    ggml_backend_buffer_t  buffer;
+    void *                 data;
+};
+
+struct d3d11_prefetch_state {
+    ggml_backend_buffer_t                 dummy = nullptr;
+    std::vector<d3d11_prefetch_saved>     saved;
+    std::unordered_set<const ggml_tensor *> seen;
+    size_t                                off = 0;
+};
+
+static bool ggml_d3d11_is_d3d11_buffer(const ggml_tensor * t) {
+    return t->buffer != nullptr && t->buffer->iface.free_buffer == ggml_backend_d3d11_buffer_free_buffer;
+}
+
+static void ggml_d3d11_prefetch_patch(d3d11_prefetch_state & st, ggml_tensor * t) {
+    if (t == nullptr || !st.seen.insert(t).second) {
+        return;
+    }
+    ggml_tensor * vs = t->view_src;
+    if (vs != nullptr) {
+        ggml_d3d11_prefetch_patch(st, vs);
+    }
+    if (ggml_d3d11_is_d3d11_buffer(t)) {
+        return;
+    }
+    st.saved.push_back({ t, t->buffer, t->data });
+    if (vs != nullptr) {
+        t->buffer = vs->buffer;                                  // real or dummy, as the base tensor has it now
+        t->data   = (char *) vs->data + t->view_offs;
+    } else {
+        t->buffer = st.dummy;
+        t->data   = (char *) d3d11_ptr_base + st.off;
+        st.off    = (st.off + ((ggml_nbytes(t) + 255) & ~(size_t) 255)) & 0x0FFFFFFF;   // distinct, 256-aligned, inside 256 MiB
+    }
+}
+
+static void ggml_backend_d3d11_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph,
+                                              struct ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(params);
+    if (cgraph == nullptr || cgraph->n_nodes == 0 || getenv("GGML_D3D11_NO_PREFETCH") != nullptr) {
+        return;
+    }
+    auto *             bctx = (ggml_backend_d3d11_context *) backend->context;
+    d3d11_device_ctx & dev  = *bctx->dev;
+    std::lock_guard<std::recursive_mutex> lock(dev.mutex);
+    if (dev.recording || dev.collecting) {
+        return;
+    }
+
+    // exp398: the same graph shape cannot need a new pipeline; skip the collecting encode pass (CPU cost per re-split graph)
+    {
+        uint64_t sig = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+        mix((uint64_t) cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            mix((uint64_t) n->op | ((uint64_t) n->type << 16) | ((uint64_t) ggml_is_empty(n) << 32));
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                mix((uint64_t) n->ne[d]);
+            }
+            for (int s = 0; s < 2; s++) {
+                const ggml_tensor * x = n->src[s];
+                if (x != nullptr) {
+                    mix((uint64_t) x->type | ((uint64_t) x->ne[0] << 8) | ((uint64_t) x->ne[1] << 40));
+                    mix((uint64_t) x->ne[2] * 31 + (uint64_t) x->ne[3]);
+                }
+            }
+        }
+        if (!dev.prefetch_sigs.insert(sig).second) {
+            return;
+        }
+    }
+
+    ggml_backend_d3d11_buffer_context dctx;
+    dctx.dev  = bctx->dev;
+    dctx.va   = 1ull << 20;
+    dctx.size = D3D11_MAX_BUFFER_BYTES;
+    ggml_backend_buffer dummy_buffer = {};
+    dummy_buffer.context             = &dctx;
+    dummy_buffer.size                = dctx.size;
+
+    d3d11_prefetch_state st;
+    st.dummy = &dummy_buffer;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node)) {
+            continue;
+        }
+        ggml_d3d11_prefetch_patch(st, node);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            ggml_d3d11_prefetch_patch(st, node->src[s]);
+        }
+    }
+
+    const size_t before = dev.pipelines.size();
+    dev.recording  = true;   // ggml_d3d11_begin without the profiler query; nothing is submitted
+    dev.collecting = true;
+    for (int i = 0; i < cgraph->n_nodes;) {
+        i += ggml_d3d11_encode_nodes(dev, cgraph, i);
+    }
+    dev.collecting = false;
+    dev.recording  = false;
+    dev.bind_end.clear();
+    for (auto it = st.saved.rbegin(); it != st.saved.rend(); ++it) {
+        it->t->buffer = it->buffer;
+        it->t->data   = it->data;
+    }
+    const size_t jobs = dev.pipeline_jobs.size();
+    ggml_d3d11_build_pipeline_jobs(dev);
+    if (getenv("GGML_D3D11_DEBUG") != nullptr || dev.pipelines.size() != before) {
+        // straight to stderr like the compile progress line: llama-bench / llama-cli hide log levels below error
+        fprintf(stderr, "\nggml_d3d11: prefetch: %d nodes, %zu new pipelines (%zu jobs queued)\n", cgraph->n_nodes,
+                dev.pipelines.size() - before, jobs);
+        fflush(stderr);
+    }
+}
+
 static ggml_backend_i ggml_backend_d3d11_i = {
     /* .get_name                = */ ggml_backend_d3d11_name,
     /* .free                    = */ ggml_backend_d3d11_free,
@@ -4180,7 +4456,7 @@ static ggml_backend_i ggml_backend_d3d11_i = {
     /* .graph_compute           = */ ggml_backend_d3d11_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_d3d11_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_d3d11_guid(void) {
@@ -4201,9 +4477,36 @@ static void * ggml_backend_d3d11_buffer_get_base(ggml_backend_buffer_t buffer) {
     return d3d11_ptr_base;
 }
 
+// exp396: the part holding logical byte `abs`, the offset inside it and how many bytes of the request fit before the next part
+static void ggml_d3d11_seg_locate(const ggml_backend_d3d11_buffer_context * ctx, size_t abs, size_t want,
+                                  d3d11_res *& part, size_t & part_off, size_t & n) {
+    if (ctx->parts.empty()) {
+        part = ctx->res.get();
+        part_off = abs;
+        n = want;
+        return;
+    }
+    const size_t pi = abs / ctx->part_stride;
+    GGML_ASSERT(pi < ctx->parts.size());
+    part     = ctx->parts[pi].get();
+    part_off = abs - pi * ctx->part_stride;
+    n        = std::min(want, ctx->part_stride - part_off);
+}
+
+static void ggml_backend_d3d11_buffer_memset_range(ggml_backend_d3d11_buffer_context * ctx, size_t offset, size_t size, uint8_t value) {
+    size_t done = 0;
+    while (done < size) {
+        d3d11_res * part = nullptr;
+        size_t      po = 0, n = 0;
+        ggml_d3d11_seg_locate(ctx, offset + done, size - done, part, po, n);
+        ggml_d3d11_buffer_memset(*ctx->dev, ctx->parts.empty() ? ctx->va : part->GetGPUVirtualAddress(), po, n, value);
+        done += n;
+    }
+}
+
 static void ggml_backend_d3d11_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
-    ggml_d3d11_buffer_memset(*ctx->dev, ctx->va, ggml_d3d11_tensor_offset(tensor) + offset, size, value);
+    ggml_backend_d3d11_buffer_memset_range(ctx, ggml_d3d11_tensor_offset(tensor) + offset, size, value);
 }
 
 static void ggml_backend_d3d11_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -4217,9 +4520,12 @@ static void ggml_backend_d3d11_buffer_set_tensor(ggml_backend_buffer_t buffer, g
     const size_t dst_offset = ggml_d3d11_tensor_offset(tensor) + offset;
     size_t       done       = 0;
     while (done < size) {
-        const size_t n   = std::min(size - done, (size_t) D3D11_STAGING_SIZE);
-        D3D11_BOX    box = { (UINT) (dst_offset + done), 0, 0, (UINT) (dst_offset + done + n), 1, 1 };
-        dev.ctx->UpdateSubresource(ctx->res->buf.get(), 0, &box, (const char *) data + done, 0, 0);
+        d3d11_res * part = nullptr;
+        size_t      po = 0, pn = 0;
+        ggml_d3d11_seg_locate(ctx, dst_offset + done, size - done, part, po, pn);
+        const size_t n   = std::min(pn, (size_t) D3D11_STAGING_SIZE);
+        D3D11_BOX    box = { (UINT) po, 0, 0, (UINT) (po + n), 1, 1 };
+        dev.ctx->UpdateSubresource(part->buf.get(), 0, &box, (const char *) data + done, 0, 0);
         done += n;
         // UpdateSubresource only queues the copy; a whole model queued at once ran as one 2.8 s burst at the first
         // submit on Iris Xe (Ministral 3B), past the 2 s Windows GPU timeout (DEVICE_HUNG). Run it in bounded parts.
@@ -4254,9 +4560,12 @@ static void ggml_backend_d3d11_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     const size_t src_offset = ggml_d3d11_tensor_offset(tensor) + offset;
     size_t       done       = 0;
     while (done < size) {
-        const size_t n   = std::min(size - done, (size_t) D3D11_STAGING_SIZE);
-        D3D11_BOX    box = { (UINT) (src_offset + done), 0, 0, (UINT) (src_offset + done + n), 1, 1 };
-        dev.ctx->CopySubresourceRegion(dev.readback_buf.get(), 0, 0, 0, 0, ctx->res->buf.get(), 0, &box);
+        d3d11_res * part = nullptr;
+        size_t      po = 0, pn = 0;
+        ggml_d3d11_seg_locate(ctx, src_offset + done, size - done, part, po, pn);
+        const size_t n   = std::min(pn, (size_t) D3D11_STAGING_SIZE);
+        D3D11_BOX    box = { (UINT) po, 0, 0, (UINT) (po + n), 1, 1 };
+        dev.ctx->CopySubresourceRegion(dev.readback_buf.get(), 0, 0, 0, 0, part->buf.get(), 0, &box);
         D3D11_MAPPED_SUBRESOURCE m = {};
         ggml_d3d11_check(dev.ctx->Map(dev.readback_buf.get(), 0, D3D11_MAP_READ, 0, &m), "Map (readback)");
         memcpy((char *) data + done, m.pData, n);
@@ -4270,7 +4579,7 @@ static void ggml_backend_d3d11_buffer_get_tensor(ggml_backend_buffer_t buffer, c
 }
 static void ggml_backend_d3d11_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
-    ggml_d3d11_buffer_memset(*ctx->dev, ctx->va, 0, ctx->size, value);
+    ggml_backend_d3d11_buffer_memset_range(ctx, 0, ctx->size, value);
 }
 
 static ggml_backend_buffer_i ggml_backend_d3d11_buffer_interface = {
@@ -4313,6 +4622,125 @@ static ggml_backend_buffer_t ggml_backend_d3d11_buffer_type_alloc_buffer(ggml_ba
     ctx->dev  = ggml_d3d11_shared_dev(dev);
     return ggml_backend_buffer_init(buft, ggml_backend_d3d11_buffer_interface, ctx, size);
 }
+// exp396: one segmented weight = one ggml buffer of several resources, each holding whole rows (<= D3D11_SEG_PART_BYTES)
+static ggml_backend_buffer_t ggml_backend_d3d11_buffer_type_alloc_segmented(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
+    auto * dev = (d3d11_device_ctx *) buft->context;
+    std::lock_guard<std::recursive_mutex> lock(dev->mutex);
+    const size_t rb   = t->nb[1];
+    const size_t rows = (size_t) t->ne[1];
+    const size_t rpp  = std::max<size_t>(1, D3D11_SEG_PART_BYTES / rb);
+    auto * ctx        = new ggml_backend_d3d11_buffer_context();
+    ctx->dev          = ggml_d3d11_shared_dev(dev);
+    ctx->part_stride  = rpp * rb;
+    for (size_t r0 = 0; r0 < rows; r0 += rpp) {
+        const size_t bytes = std::min(rpp, rows - r0) * rb;
+        const size_t alloc = std::max((size_t) D3D11_BINDING_ALIGNMENT, (bytes + D3D11_BINDING_ALIGNMENT - 1) & ~((size_t) D3D11_BINDING_ALIGNMENT - 1)) +
+                             D3D11_BINDING_ALIGNMENT;
+        com_ptr<d3d11_res> res = ggml_d3d11_create_buffer(*dev, alloc, D3D11_HEAP_TYPE_DEFAULT, nullptr);
+        if (!res) {
+            delete ctx;   // releases the parts made so far
+            return nullptr;
+        }
+        ctx->parts.push_back(res);
+    }
+    ctx->res  = ctx->parts[0];
+    ctx->va   = ctx->res->GetGPUVirtualAddress();
+    ctx->size = rows * rb;
+    GGML_LOG_INFO("ggml_d3d11: weight %s (%zu MiB, %zu rows) held in %zu parts of up to %zu rows\n", t->name,
+                  ggml_nbytes(t) >> 20, rows, ctx->parts.size(), rpp);
+    return ggml_backend_buffer_init(buft, ggml_backend_d3d11_buffer_interface, ctx, GGML_PAD(ggml_nbytes(t), D3D11_BINDING_ALIGNMENT));
+}
+
+// like the default planner of ggml-backend.cpp (tensors packed into buffers of at most max_size), except that a segmented
+// weight gets a buffer of its own
+static ggml_backend_buffer_t ggml_backend_d3d11_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n) {
+    struct item { size_t size; int first, last; bool seg; };
+    std::vector<item> plan;
+    const size_t align    = ggml_backend_buft_get_alignment(buft);
+    const size_t max_size = ggml_backend_buft_get_max_size(buft);
+    size_t       cur      = 0;
+    int          first    = 0;
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor * t = tensors[i];
+        size_t this_size = 0;
+        bool   seg       = false;
+        if (t->data == nullptr && t->view_src == nullptr) {
+            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+            seg       = ggml_d3d11_seg_weight(t);
+        }
+        if (seg) {
+            if (cur > 0) {
+                plan.push_back({ cur, first, i, false });
+            }
+            plan.push_back({ this_size, i, i + 1, true });
+            cur   = 0;
+            first = i + 1;
+            continue;
+        }
+        if (this_size == 0 && cur == 0 && !plan.empty() && first == i) {
+            plan.back().last = i + 1;   // a view right after a segmented weight
+            first            = i + 1;
+            continue;
+        }
+        if (cur > 0 && cur + this_size > max_size) {
+            plan.push_back({ cur, first, i, false });
+            cur   = this_size;
+            first = i;
+        } else {
+            cur += this_size;
+        }
+    }
+    if (cur > 0) {
+        plan.push_back({ cur, first, n, false });
+    }
+    std::vector<ggml_backend_buffer_t> buffers;
+    for (const item & it : plan) {
+        ggml_backend_buffer_t buffer = it.seg ? ggml_backend_d3d11_buffer_type_alloc_segmented(buft, tensors[it.first])
+                                              : ggml_backend_buft_alloc_buffer(buft, it.size);
+        ggml_tensor * failed = nullptr;
+        if (buffer == nullptr) {
+            GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), it.size);
+        } else {
+            struct ggml_tallocr ta = ggml_tallocr_new(buffer);
+            for (int j = it.first; j < it.last && failed == nullptr; j++) {
+                ggml_tensor * t = tensors[j];
+                if (t->data == nullptr) {
+                    if (t->view_src == nullptr) {
+                        if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                            failed = t;
+                        }
+                    } else if (t->buffer == nullptr) {
+                        if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                            failed = t;
+                        }
+                    }
+                } else if (t->view_src != nullptr && t->buffer == nullptr) {
+                    if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                        failed = t;
+                    }
+                }
+            }
+            if (failed != nullptr) {
+                GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, failed->name);
+            }
+        }
+        if (buffer == nullptr || failed != nullptr) {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+            }
+            for (ggml_backend_buffer_t b : buffers) {
+                ggml_backend_buffer_free(b);
+            }
+            return nullptr;
+        }
+        buffers.push_back(buffer);
+    }
+    if (buffers.empty()) {
+        return nullptr;
+    }
+    return buffers.size() == 1 ? buffers[0] : ggml_backend_multi_buffer_alloc_buffer(buffers.data(), buffers.size());
+}
+
 static size_t ggml_backend_d3d11_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return D3D11_BINDING_ALIGNMENT;
@@ -4926,10 +5354,18 @@ static bool ggml_backend_d3d11_device_supports_op(ggml_backend_dev_t dev, const 
     // Intel and the MTT S80, and /Od or unrolled loops did not fix it
     const bool amd_fa = ctx->vendor_id == 0x1002 && op->op == GGML_OP_FLASH_ATTN_EXT && op->src[2]->ne[0] >= 192;
     // a tensor over the raw view limit cannot be bound; the model loader then keeps such a weight in host memory
-    bool too_big = ggml_nbytes(op) > D3D11_MAX_BUFFER_BYTES;
+    // exp392 (exp389 + sources): a tensor of exactly 512 MiB (= D3D11_MAX_BUFFER_BYTES + 256) is accepted as dst AND as source.
+    // exp389 (RX, gemma-4-E2B Q4_0, placecap run): the output weight copy moved to the GPU (gpu 1434.77 MiB = DX12) but CPU compute
+    // stayed 529.03 MiB, splits 3, tg32 70.89 vs DX12 83.89 t/s: the 512 MiB logits tensor is the SOURCE of the next ops
+    // (final logit softcap: scale, tanh, scale) and was refused here by the old source limit. create_buffer allows MAX+256.
+    bool too_big = ggml_nbytes(op) > D3D11_MAX_BUFFER_BYTES + 256 && !(op->op == GGML_OP_NONE && ggml_d3d11_seg_weight(op) && (op->data == nullptr || ggml_d3d11_seg_ctx(op) != nullptr));   // exp399/403: a segmented weight leaf, or an unplaced one (the no_alloc fit pass of llama-completion)
+    const bool seg_mm = ggml_d3d11_seg_mul_mat_ok(op);   // exp396: src0 of this MUL_MAT may be held in segments
     for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
+        if (i == 0 && seg_mm) {
+            continue;
+        }
         const ggml_tensor * t = op->src[i]->view_src ? op->src[i]->view_src : op->src[i];
-        too_big = too_big || ggml_nbytes(t) > D3D11_MAX_BUFFER_BYTES;
+        too_big = too_big || ggml_nbytes(t) > D3D11_MAX_BUFFER_BYTES + 256;
     }
     const bool ok  = !amd_fa && !too_big && ggml_d3d11_supports_op(ctx, op);
     if (!ok && ctx->stats) {
@@ -5105,7 +5541,7 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
         /* .iface = */ {
             /* .get_name       = */ ggml_backend_d3d11_buffer_type_get_name,
             /* .alloc_buffer   = */ ggml_backend_d3d11_buffer_type_alloc_buffer,
-            /* .alloc_buffer_n = */ NULL,
+            /* .alloc_buffer_n = */ ggml_backend_d3d11_buffer_type_alloc_buffer_n,
             /* .get_alignment  = */ ggml_backend_d3d11_buffer_type_get_alignment,
             /* .get_max_size   = */ ggml_backend_d3d11_buffer_type_get_max_size,
             /* .get_alloc_size = */ NULL,
