@@ -1611,6 +1611,19 @@ static bool ggml_d3d11_use_tiled(const d3d11_device_ctx & dev, ggml_tensor * src
            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
 }
 
+// exp682: float weights whose K is not a multiple of 32 (K % 4 != 0 by default, every K with GGML_D3D11_TILED_TAIL=2) and enough columns for the tiled kernel
+static bool ggml_d3d11_use_tiled_tail(const d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    static const char * env = getenv("GGML_D3D11_TILED_TAIL");
+    const int mode = env ? atoi(env) : 1;
+    if (mode == 0 || src0->ne[0] % 32 == 0 || (mode == 1 && src0->ne[0] % 4 == 0)) {
+        return false;
+    }
+    const uint32_t t_cols = (uint32_t) src0->type < (uint32_t) GGML_TYPE_COUNT ? dev.tiled_type_cols[src0->type] : 0;
+    const uint32_t gate   = t_cols != 0 ? t_cols : dev.tiled_min_cols;
+    return gate != 0 && (uint32_t) dst->ne[1] >= gate && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
+}
+
 // dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
 static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                      ggml_tensor * dst) {
@@ -1622,6 +1635,9 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
     std::vector<std::string> defines = { define };
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
+    }
+    if (src0->ne[0] % 32 != 0) {
+        defines.push_back("K_TAIL");   // exp685: last K tile guarded (F32 / F16 weights only, see ggml_d3d11_use_tiled_tail)
     }
     if (ggml_d3d11_tile_m(src0->type) != 64) {
         defines.push_back("TILE_M=" + std::to_string(ggml_d3d11_tile_m(src0->type)));
@@ -1689,6 +1705,10 @@ static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1,
     ggml_tensor * src0 = mats[0].src0;
     if (mats.size() == 1 && mats[0].add == nullptr && ggml_d3d11_seg_spans(src0)) {
         ggml_d3d11_mul_mat_segmented(dev, src0, src1, mats[0].dst);
+        return;
+    }
+    if (mats.size() == 1 && mats[0].add == nullptr && ggml_d3d11_use_tiled_tail(dev, src0, src1, mats[0].dst)) {
+        ggml_d3d11_mul_mat_tiled(dev, src0, src1, mats[0].dst);
         return;
     }
     if (ggml_d3d11_mul_mat_scalar_needed(src0)) {
@@ -5497,6 +5517,7 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
             }
         } else if (dev.vendor_id == 0x1002) {
             dev.tiled_type_cols[GGML_TYPE_Q6_K] = 5;
+            dev.tiled_type_cols[GGML_TYPE_F32] = 0x7FFFFFFF;   // exp683: the AMD driver stalls creating the tiled SRC0_F32 pipeline (ACT / Octo hang)
         }
     }
     if (const char * env = getenv("GGML_D3D11_TILED_MMID")) {
