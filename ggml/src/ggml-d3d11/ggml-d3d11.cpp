@@ -1611,6 +1611,19 @@ static bool ggml_d3d11_use_tiled(const d3d11_device_ctx & dev, ggml_tensor * src
            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
 }
 
+// exp682: float weights whose K is not a multiple of 32 (K % 4 != 0 by default, every K with GGML_D3D11_TILED_TAIL=2) and enough columns for the tiled kernel
+static bool ggml_d3d11_use_tiled_tail(const d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    static const char * env = getenv("GGML_D3D11_TILED_TAIL");
+    const int mode = env ? atoi(env) : 1;
+    if (mode == 0 || src0->ne[0] % 32 == 0 || (mode == 1 && src0->ne[0] % 4 == 0)) {
+        return false;
+    }
+    const uint32_t t_cols = (uint32_t) src0->type < (uint32_t) GGML_TYPE_COUNT ? dev.tiled_type_cols[src0->type] : 0;
+    const uint32_t gate   = t_cols != 0 ? t_cols : dev.tiled_min_cols;
+    return gate != 0 && (uint32_t) dst->ne[1] >= gate && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
+}
+
 // dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
 static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                      ggml_tensor * dst) {
@@ -1622,6 +1635,9 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
     std::vector<std::string> defines = { define };
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
+    }
+    if (src0->ne[0] % 32 != 0) {
+        defines.push_back("K_TAIL");   // exp685: last K tile guarded (F32 / F16 weights only, see ggml_d3d11_use_tiled_tail)
     }
     if (ggml_d3d11_tile_m(src0->type) != 64) {
         defines.push_back("TILE_M=" + std::to_string(ggml_d3d11_tile_m(src0->type)));
@@ -1689,6 +1705,10 @@ static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1,
     ggml_tensor * src0 = mats[0].src0;
     if (mats.size() == 1 && mats[0].add == nullptr && ggml_d3d11_seg_spans(src0)) {
         ggml_d3d11_mul_mat_segmented(dev, src0, src1, mats[0].dst);
+        return;
+    }
+    if (mats.size() == 1 && mats[0].add == nullptr && ggml_d3d11_use_tiled_tail(dev, src0, src1, mats[0].dst)) {
+        ggml_d3d11_mul_mat_tiled(dev, src0, src1, mats[0].dst);
         return;
     }
     if (ggml_d3d11_mul_mat_scalar_needed(src0)) {
@@ -3563,10 +3583,29 @@ static void ggml_d3d11_flash_attn_ext(d3d11_device_ctx & dev, ggml_tensor * dst)
     }
     // one query row (decode): a workgroup per (row, KV block) instead of a thread, as in the D3D12 backend; the
     // thread-per-block kernel left most of the GPU idle during generation
-    const bool     decode = q->ne[1] == 1 && !dev.no_fuse;
+    // exp547: prompt rows take the same kernel on Moore Threads (D3D12 exp509/510: the thread-per-block kernel spills at head size 256/512).
+    // GGML_D3D11_FA_PROMPT_DECODE=0/1 overrides the vendor default (1 on every vendor).
+    static const char * fa_env = getenv("GGML_D3D11_FA_PROMPT_DECODE");
+    const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : true;   // exp567: on for every vendor
+    const bool     decode = (q->ne[1] == 1 || prompt_decode) && !dev.no_fuse;
+    // GQ query heads that share one KV head (and one mask row) go into one workgroup (D3D12 exp539); GGML_D3D11_FA_GQ=N overrides, 1 = off
+    uint32_t gq = 1;
+    if (decode && q->ne[1] > 1 && max_bias == 0.0f && (!mask || mask->ne[2] == 1) &&
+        k->ne[2] == v->ne[2] && q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]) {
+        static const char * gq_env = getenv("GGML_D3D11_FA_GQ");
+        gq = gq_env ? (uint32_t) atoi(gq_env) : 4u;
+        const uint32_t rk2_h = (uint32_t) (q->ne[2] / k->ne[2]);
+        while (gq > 1 && (rk2_h % gq != 0 || (uint32_t) q->ne[2] % gq != 0)) {
+            gq /= 2;
+        }
+        gq = std::max<uint32_t>(gq, 1u);
+    }
     const uint32_t blk    = decode ? D3D11_WG_SIZE : D3D11_FLASH_ATTN_BLK;
     if (decode) {
         defines.push_back("DECODE");
+        if (gq > 1) {
+            defines.push_back("GQ=" + std::to_string(gq));
+        }
     } else {
         // thread-per-block pass 1 keeps q and acc per thread: 256 threads exceed FXC's register budget (X4714)
         defines.push_back("WG_SIZE=" + std::to_string(D3D11_FLASH_ATTN_WG));
@@ -3629,6 +3668,9 @@ static void ggml_d3d11_flash_attn_ext(d3d11_device_ctx & dev, ggml_tensor * dst)
 
     for (uint64_t row0 = 0, n = 0; row0 < n_rows; row0 += n) {
         n = std::min(n_rows - row0, std::max<uint64_t>(1, std::min(dev.fa_work / row_work, tmp_rows)));
+        if (gq > 1) {
+            n = std::max<uint64_t>(gq, n - n % gq);   // row0 and n stay multiples of gq (n_rows is a multiple of n_head)
+        }
         params[row0_idx]     = (uint32_t) row0;
         params[row0_idx + 1] = (uint32_t) n;
         if (big && dev.dispatches_in_list > 0) {
@@ -3649,7 +3691,7 @@ static void ggml_d3d11_flash_attn_ext(d3d11_device_ctx & dev, ggml_tensor * dst)
         }
         const std::vector<D3D11_GPU_VIRTUAL_ADDRESS> uavs = { bq.va, bk.va, bv.va, bm.va, bs.va, bd.va, tmp_va };
         ggml_d3d11_dispatch(dev, pipeline, params, uavs,
-                            decode ? (uint32_t) n * n_blocks : CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D11_FLASH_ATTN_WG));
+                            decode ? (uint32_t) (n / gq) * n_blocks : CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D11_FLASH_ATTN_WG));
         ggml_d3d11_dispatch(dev, combine, params, uavs, CEIL_DIV((uint32_t) n, (uint32_t) D3D11_FLASH_ATTN_WG));
     }
 }
@@ -5475,6 +5517,7 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
             }
         } else if (dev.vendor_id == 0x1002) {
             dev.tiled_type_cols[GGML_TYPE_Q6_K] = 5;
+            dev.tiled_type_cols[GGML_TYPE_F32] = 0x7FFFFFFF;   // exp683: the AMD driver stalls creating the tiled SRC0_F32 pipeline (ACT / Octo hang)
         }
     }
     if (const char * env = getenv("GGML_D3D11_TILED_MMID")) {

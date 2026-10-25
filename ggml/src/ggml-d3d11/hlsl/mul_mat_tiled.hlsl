@@ -99,6 +99,14 @@ float load_src1(uint i) {
 // TILE_K, so for the block types it lands exactly on a block or K-quant sub-block boundary.
 void load_a_row(uint row_base, uint k0, out float vals[TILE_K]) {
 #if defined(SRC0_F32)
+#if defined(K_TAIL)
+    if (k0 + TILE_K > k) {
+        [unroll] for (uint i = 0; i < TILE_K; i++) {
+            vals[i] = (k0 + i < k) ? LOAD_F32(src0, row_base + k0 + i) : 0.0f;
+        }
+        return;
+    }
+#endif
     [unroll] for (uint i = 0; i < TILE_K; i += 4) {
         const uint4 w = src0.Load4((row_base + k0 + i) * 4);
         vals[i + 0] = asfloat(w.x);
@@ -107,6 +115,18 @@ void load_a_row(uint row_base, uint k0, out float vals[TILE_K]) {
         vals[i + 3] = asfloat(w.w);
     }
 #elif defined(SRC0_F16)
+#if defined(K_TAIL)
+    if (k0 + TILE_K > k) {
+        [unroll] for (uint i = 0; i < TILE_K; i++) {
+            uint bits = 0;
+            if (k0 + i < k) {
+                LOAD_U16_UNALIGNED(src0, (row_base + k0 + i) * 2, bits);
+            }
+            vals[i] = f16tof32(bits);
+        }
+        return;
+    }
+#endif
     [unroll] for (uint i = 0; i < TILE_K; i += 2) {
         uint w;
         LOAD_U32_UNALIGNED(src0, (row_base + k0 + i) * 2, w);
@@ -235,6 +255,23 @@ uint a_elem(uint p, uint i) {
 }
 
 void load_a_part(uint row_base, uint k0, uint p, out float v[8]) {
+#if defined(K_TAIL) && (defined(SRC0_F32) || defined(SRC0_F16))
+    if (k0 + p * 8 + 8 > k) {
+        [unroll] for (uint i = 0; i < 8; i++) {
+            const uint kk = k0 + p * 8 + i;
+#if defined(SRC0_F32)
+            v[i] = (kk < k) ? LOAD_F32(src0, row_base + kk) : 0.0f;
+#else
+            uint bits = 0;
+            if (kk < k) {
+                LOAD_U16_UNALIGNED(src0, (row_base + kk) * 2, bits);
+            }
+            v[i] = f16tof32(bits);
+#endif
+        }
+        return;
+    }
+#endif
 #if defined(SRC0_F32)
     const uint4 w0 = src0.Load4((row_base + k0 + p * 8) * 4);
     const uint4 w1 = src0.Load4((row_base + k0 + p * 8 + 4) * 4);
@@ -455,7 +492,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #endif
         [unroll] for (uint i = 0; i < 4; i++) {
             const uint ki = b_part * 4 + i;
+            #if defined(K_TAIL)
+            Btile[ki][b_col] = (b_ok && kt + ki < k) ? load_src1(b_base + kt + ki) : 0.0f;
+#else
             Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0f;
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
 
