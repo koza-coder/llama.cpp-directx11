@@ -11,8 +11,8 @@
 > - **Build, test, settings:** [README-D3D11.md](README-D3D11.md)
 > - **Backend source:** [ggml/src/ggml-d3d11](ggml/src/ggml-d3d11)
 > - **Other versions:** [DirectX 12](https://github.com/koza-coder/llama.cpp-directx12) (first choice on current GPUs,
->   faster generation), [OpenGL](https://github.com/koza-coder/llama.cpp-opengl) - same llama.cpp, only the GPU
->   backend differs
+>   faster generation), [OpenGL](https://github.com/koza-coder/llama.cpp-opengl) - same llama.cpp, only the GPU backend differs
+> - **Experimental:** [DirectX 9](https://github.com/koza-coder/llama.cpp-directx9) - only the matrix products run on the GPU
 >
 > Everything below is the upstream llama.cpp README.
 
