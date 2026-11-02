@@ -1740,7 +1740,15 @@ static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1,
     // single-column (decode) products skip the per-element column loop (+50% decode on the MTT S80).
     // Not for F32 weights: on the S80 that variant failed MUL_MAT f32 k=256 bs=[3,2] nr=[1,2] (ERR 0.3,
     // deterministic) while F16 and the quant types passed the same shape; cause not found yet.
-    const bool     one_col  = mats[0].dst->ne[1] == 1 && src0->type != GGML_TYPE_F32;
+    // exp826/exp828: on the MTT S80 the generic column loop made a 2-token batch of a Q4_K_M 9B cost 4.6x one token (399 vs 86 ms);
+    // 2..15 columns of types without the MULTI_COL kernel run as single-column dispatches instead (port of DX12 exp797).
+    // GGML_D3D11_MV_PERCOL=N sets the column limit on any GPU (0 = off).
+    static const int percol_env = [] { const char * e = getenv("GGML_D3D11_MV_PERCOL"); return e ? atoi(e) : -1; }();
+    const uint32_t percol_max = percol_env >= 0 ? (uint32_t) percol_env : 15u;   // exp846: all GPUs (RX R9700 4.8x at 4-8 tokens, exp841)
+    const bool     mc_type  = dev.mv_multi && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
+                              src0->ne[0] % 32 == 0 && src1->type == GGML_TYPE_F32;
+    const bool     per_col  = mats[0].dst->ne[1] > 1 && (uint32_t) mats[0].dst->ne[1] <= percol_max && !mc_type;
+    const bool     one_col  = (mats[0].dst->ne[1] == 1 || per_col) && src0->type != GGML_TYPE_F32;
     const uint32_t max_cols = one_col ? 1 : 4;
     // exp360: 2..4 columns with the word-window kernels (each weight word decoded once, FMA into up to 4 columns)
     const bool multi_col = dev.mv_multi && !one_col && mats[0].dst->ne[1] > 1 &&
