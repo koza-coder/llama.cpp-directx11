@@ -756,6 +756,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
     ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
+    if (arch == LLM_ARCH_CLOVER_MOE) {
+        ms.add_kv(LLM_KV_CLOVER_CORESET_ENABLED, true);
+        ms.add_kv(LLM_KV_CLOVER_CORESET_TOP_P,   0.9f);
+    }
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
     ms.add_kv(LLM_KV_KDA_SAFE_GATE,             true);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,      -5.0f);

@@ -900,6 +900,8 @@ class MODEL_TENSOR(IntEnum):
     LAUREL_POST_NORM     = auto() # gemma3n
     SSM_IN               = auto()
     SSM_CONV1D           = auto()
+    SSM_BD_LOGIT_SCALE   = auto() # clover: per-head preview Q/K score scale
+    SSM_BD_HISTORY       = auto() # clover: history logit coefficient (.weight) and offset (.bias)
     SSM_X                = auto()
     SSM_DT               = auto()
     SSM_DT_NORM          = auto()
@@ -1815,6 +1817,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.LAUREL_POST_NORM:          "blk.{bid}.laurel_post_norm",     # gemma3n
     MODEL_TENSOR.SSM_IN:                    "blk.{bid}.ssm_in",
     MODEL_TENSOR.SSM_CONV1D:                "blk.{bid}.ssm_conv1d",
+    MODEL_TENSOR.SSM_BD_LOGIT_SCALE:        "blk.{bid}.ssm_bd_logit_scale",
+    MODEL_TENSOR.SSM_BD_HISTORY:            "blk.{bid}.ssm_bd_history",
     MODEL_TENSOR.SSM_X:                     "blk.{bid}.ssm_x",
     MODEL_TENSOR.SSM_DT:                    "blk.{bid}.ssm_dt",
     MODEL_TENSOR.SSM_DT_NORM:               "blk.{bid}.ssm_dt_norm",
@@ -3567,6 +3571,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_BETA,
         MODEL_TENSOR.SSM_ALPHA,
         MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.SSM_BD_LOGIT_SCALE,
+        MODEL_TENSOR.SSM_BD_HISTORY,
     ],
     MODEL_ARCH.QWEN4EXP: [
         MODEL_TENSOR.TOKEN_EMBD,
