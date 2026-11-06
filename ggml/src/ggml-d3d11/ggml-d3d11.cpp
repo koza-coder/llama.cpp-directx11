@@ -1625,8 +1625,9 @@ static bool ggml_d3d11_use_tiled_tail(const d3d11_device_ctx & dev, ggml_tensor 
 }
 
 // dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
+// dst_ld != 0: dst is a row slice whose columns are dst_ld floats apart (segmented weights, exp1032)
 static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
-                                     ggml_tensor * dst) {
+                                     ggml_tensor * dst, uint32_t dst_ld = 0) {
     std::string define = "SRC0_";
     define += ggml_type_name(src0->type);
     for (auto & ch : define) {
@@ -1641,6 +1642,9 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
     }
     if (ggml_d3d11_tile_m(src0->type) != 64) {
         defines.push_back("TILE_M=" + std::to_string(ggml_d3d11_tile_m(src0->type)));
+    }
+    if (dst_ld != 0) {
+        defines.push_back("DST_S1");
     }
     d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
 
@@ -1661,6 +1665,9 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
         (uint32_t) dst->ne[2], broadcast2, broadcast3,
         (uint32_t) (dst->ne[2] * dst->ne[3]),
     };
+    if (dst_ld != 0) {
+        params.push_back(dst_ld);
+    }
 
     // tile sizes must match TILE_M and TILE_N in mul_mat_tiled.hlsl
     const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], ggml_d3d11_tile_m(src0->type));
@@ -1985,6 +1992,22 @@ static void ggml_d3d11_mul_mat_segmented(d3d11_device_ctx & dev, ggml_tensor * s
         s0.data         = (void *) (base + off0 + r0 * rb);
         s0.view_src     = nullptr;
         s0.view_offs    = 0;
+        // exp1032: enough columns for the tiled kernel = one dispatch for all columns of this part (it wrote dst rows r0..r0+nr
+        // of every column through the column stride); before, every column re-read the whole part (DiffusionGemma-26B: 70 % of
+        // the GPU time). GGML_D3D11_SEG_TILED=0 restores the per-column mat-vecs.
+        static const bool seg_tiled = [] { const char * e = getenv("GGML_D3D11_SEG_TILED"); return e == nullptr || atoi(e) != 0; }();
+        if (seg_tiled && src1->ne[1] > 1 && dst->nb[1] % sizeof(float) == 0 && ggml_d3d11_use_tiled(dev, &s0, src1, dst)) {
+            ggml_tensor d = *dst;
+            d.ne[0]       = (int64_t) nr;
+            d.nb[2]       = d.nb[3] = dst->nb[1] * (size_t) dst->ne[1];
+            d.data        = (void *) (base + offd + r0 * sizeof(float));
+            d.view_src    = nullptr;
+            d.view_offs   = 0;
+            std::fill(std::begin(dev.out_nodes), std::end(dev.out_nodes), nullptr);
+            dev.out_nodes[0] = &d;
+            ggml_d3d11_mul_mat_tiled(dev, &s0, src1, &d, (uint32_t) (dst->nb[1] / sizeof(float)));
+            continue;
+        }
         for (int64_t col = 0; col < src1->ne[1]; col++) {
             ggml_tensor s1 = *src1;
             s1.ne[1]       = 1;

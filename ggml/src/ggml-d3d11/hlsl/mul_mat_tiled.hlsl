@@ -64,6 +64,9 @@ cbuffer Params : register(b0) {
     uint dst_s2;      // dst->nb[2] in elements
     uint list_base;   // first list entry in scratch
 #endif
+#if defined(DST_S1)
+    uint dst_ld;      // dst column stride in elements: a segmented weight part writes a row slice of dst (exp1032)
+#endif
     uint nwg_x;
 };
 
@@ -536,7 +539,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #else
             const uint c = col0 + tx * REG_N + in4;
             if (c < n) {
+#if defined(DST_S1)
+                STORE_F32(dst, dst_base + c * dst_ld + r, acc[im4][in4]);
+#else
                 STORE_F32(dst, dst_base + c * m + r, acc[im4][in4]);
+#endif
             }
 #endif
         }
