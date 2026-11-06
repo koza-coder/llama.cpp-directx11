@@ -4910,6 +4910,7 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_DUP:
             return (type_ok(op->type) && type_ok(src0->type)) ||
                    (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_BF16 && ggml_nelements(op) <= UINT32_MAX) ||
+                   (op->type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_F32 && ggml_nelements(op) <= UINT32_MAX) ||
                    ggml_d3d11_cpy_dequant_type(src0, op) || ggml_d3d11_cpy_quantize_type(src0, op) ||
                    (ggml_d3d11_cpy_raw_type(ctx->caps, src0, op) && ggml_nelements(op) <= UINT32_MAX);
         case GGML_OP_ADD:
