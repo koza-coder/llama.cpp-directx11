@@ -5434,9 +5434,13 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
 
 static bool ggml_backend_d3d11_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     auto *     ctx = (d3d11_device_ctx *) dev->context;
-    // AMD (R9700): flash attention with V head size >= 192 gives wrong values; the same DXBC is right on
-    // Intel and the MTT S80, and /Od or unrolled loops did not fix it
-    const bool amd_fa = ctx->vendor_id == 0x1002 && op->op == GGML_OP_FLASH_ATTN_EXT && op->src[2]->ne[0] >= 192;
+    // AMD (R9700): flash attention with a big V head gives wrong values; the same DXBC is right on Intel and
+    // the MTT S80, and /Od or unrolled loops did not fix it. exp1039 (R9700, Ryzen 5700G box): V head 192 and 256 correct
+    // in every test case, V head 512 wrong in 8 of 389 (long kv), so only V head > 256 is refused (was >= 192 until v0.4.2).
+    // GGML_D3D11_FA_AMD=1 allows every head size, =0 restores the old limit.
+    static const int fa_amd_env = [] { const char * e = getenv("GGML_D3D11_FA_AMD"); return e ? atoi(e) : -1; }();
+    const int64_t fa_amd_max_dv = fa_amd_env == 1 ? INT64_MAX : fa_amd_env == 0 ? 191 : 256;
+    const bool amd_fa = ctx->vendor_id == 0x1002 && op->op == GGML_OP_FLASH_ATTN_EXT && op->src[2]->ne[0] > fa_amd_max_dv;
     // a tensor over the raw view limit cannot be bound; the model loader then keeps such a weight in host memory
     // exp392 (exp389 + sources): a tensor of exactly 512 MiB (= D3D11_MAX_BUFFER_BYTES + 256) is accepted as dst AND as source.
     // exp389 (RX, gemma-4-E2B Q4_0, placecap run): the output weight copy moved to the GPU (gpu 1434.77 MiB = DX12) but CPU compute
