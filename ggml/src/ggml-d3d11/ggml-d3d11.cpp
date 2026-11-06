@@ -241,6 +241,9 @@ struct d3d11_device_ctx {
     // flash attention block results, grown on demand
     com_ptr<d3d11_res> fa_tmp;
     size_t             fa_tmp_size = 0;
+    // exp1055: split-K partial products of the tiled MUL_MAT, grown on demand
+    com_ptr<d3d11_res> sk_tmp;
+    size_t             sk_tmp_size = 0;
     uint64_t           fa_work     = D3D11_FLASH_ATTN_WORK;   // adapted to the measured submit time
     bool               fa_work_fixed = false;                 // GGML_D3D11_FA_WORK: no adaptation
 
@@ -1626,8 +1629,92 @@ static bool ggml_d3d11_use_tiled_tail(const d3d11_device_ctx & dev, ggml_tensor 
 
 // dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
 // dst_ld != 0: dst is a row slice whose columns are dst_ld floats apart (segmented weights, exp1032)
+// exp1055: number of K chunks for the tiled MUL_MAT (1 = no split). A float weight with a huge K and few output tiles
+// leaves most of the GPU idle; the chunks run as batches of one dispatch, splitk_reduce.hlsl sums them.
+static uint32_t ggml_d3d11_splitk_n(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const int env = [] { const char * e = getenv("GGML_D3D11_SPLITK"); return e ? atoi(e) : -1; }();
+    if (env == 0 || (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) || src1->type != GGML_TYPE_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return 1;
+    }
+    const uint64_t k     = (uint64_t) src0->ne[0];
+    const uint64_t tiles = (uint64_t) CEIL_DIV((uint32_t) dst->ne[0], ggml_d3d11_tile_m(src0->type)) * CEIL_DIV((uint32_t) dst->ne[1], 32u);
+    uint32_t s = 1;
+    if (env > 1) {
+        s = (uint32_t) env;
+    } else {
+        if (k < 16384 || tiles >= 256) {
+            return 1;
+        }
+        while (s < 32 && tiles * s < 512 && k / (s * 2) >= 4096) {
+            s *= 2;
+        }
+    }
+    while (s > 1 && k % (s * 32) != 0) {
+        s /= 2;
+    }
+    if ((uint64_t) s * dst->ne[0] * dst->ne[1] * sizeof(float) > (256ull << 20)) {
+        return 1;
+    }
+    return s;
+}
+
+static void ggml_d3d11_mul_mat_splitk(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst,
+                                      uint32_t dst_ld, uint32_t n_split) {
+    std::vector<std::string> defines = { src0->type == GGML_TYPE_F16 ? "SRC0_F16" : "SRC0_F32" };
+    if (ggml_d3d11_tile_m(src0->type) != 64) {
+        defines.push_back("TILE_M=" + std::to_string(ggml_d3d11_tile_m(src0->type)));
+    }
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
+    d3d11_pipeline & reduce   = ggml_d3d11_get_pipeline(dev, "splitk_reduce", hlsl_splitk_reduce, {});
+
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
+    const size_t        t0 = ggml_type_size(src0->type);
+    const size_t        t1 = ggml_type_size(src1->type);
+    const uint32_t      m  = (uint32_t) dst->ne[0];
+    const uint32_t      n  = (uint32_t) dst->ne[1];
+    const uint32_t      kc = (uint32_t) (src0->ne[0] / n_split);
+
+    const size_t need = (size_t) n_split * m * n * sizeof(float);
+    if (dev.sk_tmp_size < need) {
+        // the old buffer may still be referenced by recorded dispatches: run them before releasing it
+        if (dev.dispatches_in_list > 0) {
+            ggml_d3d11_submit_and_wait(dev);
+            ggml_d3d11_begin(dev, true);
+        }
+        size_t size = 1ull << 20;
+        while (size < need) {
+            size *= 2;
+        }
+        dev.sk_tmp      = ggml_d3d11_create_buffer(dev, size, D3D11_HEAP_TYPE_DEFAULT, L"ggml_d3d11_splitk_tmp");
+        dev.sk_tmp_size = size;
+    }
+    const D3D11_GPU_VIRTUAL_ADDRESS tmp_va = dev.sk_tmp->GetGPUVirtualAddress();
+
+    // chunk z is batch z: src0 and src1 advance by kc elements per batch, the partial product z lands at z * m * n
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, 0u,
+        m, n, kc,
+        (uint32_t) (src0->nb[1] / t0), kc, 0u,
+        (uint32_t) (src1->nb[1] / t1), kc, 0u,
+        n_split, 1u, 1u,
+        n_split,
+    };
+    const uint32_t tiles_m = CEIL_DIV(m, ggml_d3d11_tile_m(src0->type));
+    const uint32_t tiles_n = CEIL_DIV(n, 32u);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, b0.va, tmp_va }, tiles_m * tiles_n * n_split);
+    const std::vector<uint32_t> rparams = { bd.elem_offset, m, n, n_split, dst_ld != 0 ? dst_ld : m };
+    ggml_d3d11_dispatch(dev, reduce, rparams, { tmp_va, bd.va }, CEIL_DIV(m * n, 256u));
+}
+
 static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                      ggml_tensor * dst, uint32_t dst_ld = 0) {
+    if (const uint32_t n_split = ggml_d3d11_splitk_n(src0, src1, dst); n_split > 1) {
+        ggml_d3d11_mul_mat_splitk(dev, src0, src1, dst, dst_ld, n_split);
+        return;
+    }
     std::string define = "SRC0_";
     define += ggml_type_name(src0->type);
     for (auto & ch : define) {
