@@ -3723,7 +3723,7 @@ static void ggml_d3d11_flash_attn_ext(d3d11_device_ctx & dev, ggml_tensor * dst)
         const std::vector<D3D11_GPU_VIRTUAL_ADDRESS> uavs = { bq.va, bk.va, bv.va, bm.va, bs.va, bd.va, tmp_va };
         ggml_d3d11_dispatch(dev, pipeline, params, uavs,
                             decode ? (uint32_t) (n / gq) * n_blocks : CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D11_FLASH_ATTN_WG));
-        ggml_d3d11_dispatch(dev, combine, params, uavs, CEIL_DIV((uint32_t) n, (uint32_t) D3D11_FLASH_ATTN_WG));
+        ggml_d3d11_dispatch(dev, combine, params, uavs, CEIL_DIV((uint32_t) n * (uint32_t) (v->ne[0] / 4), (uint32_t) D3D11_FLASH_ATTN_WG));   // exp1047: a thread per 4 output values
     }
 }
 
@@ -5434,12 +5434,12 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
 
 static bool ggml_backend_d3d11_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     auto *     ctx = (d3d11_device_ctx *) dev->context;
-    // AMD (R9700): flash attention with a big V head gives wrong values; the same DXBC is right on Intel and
-    // the MTT S80, and /Od or unrolled loops did not fix it. exp1039 (R9700, Ryzen 5700G box): V head 192 and 256 correct
-    // in every test case, V head 512 wrong in 8 of 389 (long kv), so only V head > 256 is refused (was >= 192 until v0.4.2).
-    // GGML_D3D11_FA_AMD=1 allows every head size, =0 restores the old limit.
+    // AMD (R9700): flash attention with a big V head gave wrong values (the same DXBC was right on Intel and the MTT S80).
+    // Cause found in exp1046/exp1047: the COMBINE pass kept float4 acc[DV / 4] per thread; split per 4 output values,
+    // every head size passes on the R9700 (V head 512 398/398, whole group 4970/4970), so AMD has no limit any more.
+    // GGML_D3D11_FA_AMD=0 restores the old limit (V head >= 192 refused), =2 the v0.4.3 one (V head > 256 refused).
     static const int fa_amd_env = [] { const char * e = getenv("GGML_D3D11_FA_AMD"); return e ? atoi(e) : -1; }();
-    const int64_t fa_amd_max_dv = fa_amd_env == 1 ? INT64_MAX : fa_amd_env == 0 ? 191 : 256;
+    const int64_t fa_amd_max_dv = fa_amd_env == 0 ? 191 : fa_amd_env == 2 ? 256 : INT64_MAX;
     const bool amd_fa = ctx->vendor_id == 0x1002 && op->op == GGML_OP_FLASH_ATTN_EXT && op->src[2]->ne[0] > fa_amd_max_dv;
     // a tensor over the raw view limit cannot be bound; the model loader then keeps such a weight in host memory
     // exp392 (exp389 + sources): a tensor of exactly 512 MiB (= D3D11_MAX_BUFFER_BYTES + 256) is accepted as dst AND as source.
