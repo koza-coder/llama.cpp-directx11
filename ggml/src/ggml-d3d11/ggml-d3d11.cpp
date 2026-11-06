@@ -3965,6 +3965,12 @@ static int ggml_d3d11_encode_nodes(d3d11_device_ctx & dev, const ggml_cgraph * c
 
 static int ggml_d3d11_encode_nodes_inner(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * node = cgraph->nodes[i];
+    // a node that is not marked for compute belongs to a branch ggml_build_forward_select did not pick, or an
+    // inactive branch a model leaves for allocation only (Clover delta-net decode/prefill): running it reads unset
+    // inputs and can overwrite state (exp1022)
+    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 1;
+    }
     if (!ggml_is_empty(node)) {
         if (node->op == GGML_OP_MUL_MAT) {
             return ggml_d3d11_encode_mul_mat_group(dev, cgraph, i);
