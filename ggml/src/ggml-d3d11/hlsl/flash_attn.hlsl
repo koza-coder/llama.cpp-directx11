@@ -240,7 +240,9 @@ float4 load_v4(uint i) {
 void main(uint3 id : SV_DispatchThreadID) {
     const uint gi = flat_index(id, nwg_x);
 #if defined(COMBINE)
-    const uint t = gi;
+    // exp1047: one thread per (row, 4 output values): no per-thread acc[DV / 4] array (512 floats at DV=512 went wrong on AMD)
+    const uint t  = gi / (DV / 4);
+    const uint d1 = gi % (DV / 4);
     if (t >= n_rows) {
         return;
     }
@@ -248,31 +250,25 @@ void main(uint3 id : SV_DispatchThreadID) {
     const uint i2  = row % n_head;
 
     // same online softmax as pass 1, over block log-sum-exps whose values are already normalized
-    float4 acc[DV / 4];
-    for (uint d0 = 0; d0 < DV / 4; d0++) {
-        acc[d0] = 0.0f;
-    }
-    float M = NEG_INF_SCORE;
-    float S = 0.0f;
+    float4 acc = 0.0f;
+    float  M   = NEG_INF_SCORE;
+    float  S   = 0.0f;
     for (uint b = 0; b < n_blocks; b++) {
-        const uint base = (t * n_blocks + b) * (DV + 1);
-        const float s = LOAD_F32(tmp, base);
+        const uint  base = (t * n_blocks + b) * (DV + 1);
+        const float s    = LOAD_F32(tmp, base);
         if (s <= NEG_INF_SCORE) {   // every entry of the block masked
             continue;
         }
+        const float4 o = asfloat(tmp.Load4((base + 1 + 4 * d1) * 4));
         if (s > M) {
             const float ms = exp(M - s);
-            M = s;
-            for (uint d1 = 0; d1 < DV / 4; d1++) {
-                acc[d1] = acc[d1] * ms + asfloat(tmp.Load4((base + 1 + 4 * d1) * 4));
-            }
-            S = S * ms + 1.0f;
+            M   = s;
+            acc = acc * ms + o;
+            S   = S * ms + 1.0f;
         } else {
             const float vs = exp(s - M);
-            for (uint d2 = 0; d2 < DV / 4; d2++) {
-                acc[d2] += vs * asfloat(tmp.Load4((base + 1 + 4 * d2) * 4));
-            }
-            S += vs;
+            acc += vs * o;
+            S   += vs;
         }
     }
 
@@ -281,9 +277,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float sink = LOAD_F32(sinks, offset_sinks + i2);
     if (sink > M) {
         const float ms = exp(M - sink);
-        for (uint d3 = 0; d3 < DV / 4; d3++) {
-            acc[d3] *= ms;
-        }
+        acc *= ms;
         S = S * ms + 1.0f;
     } else {
         S += exp(sink - M);
@@ -291,10 +285,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
 
     const float inv = S == 0.0f ? 0.0f : 1.0f / S;
-    const uint dst_base = offset_dst + row * DV;
-    for (uint d4 = 0; d4 < DV; d4++) {
-        STORE_F32(dst, dst_base + d4, acc[d4 / 4][d4 % 4] * inv);
-    }
+    const uint dst_base = offset_dst + row * DV + 4 * d1;
+    STORE_F32(dst, dst_base + 0, acc.x * inv);
+    STORE_F32(dst, dst_base + 1, acc.y * inv);
+    STORE_F32(dst, dst_base + 2, acc.z * inv);
+    STORE_F32(dst, dst_base + 3, acc.w * inv);
 #else
     if (gi >= n_rows * n_blocks) {
         return;
