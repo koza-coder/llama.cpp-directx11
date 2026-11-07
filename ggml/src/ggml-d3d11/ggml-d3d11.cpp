@@ -4760,6 +4760,9 @@ static ggml_backend_buffer_i ggml_backend_d3d11_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_d3d11_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 /* GGML Backend Buffer Type Interface */
@@ -5261,9 +5264,6 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
                 }
                 return ok;
             }
-                if (ggml_nelements(op) == 0) {
-                    return true;   // N = 0 (fewer than IC input channels): an empty result, like Vulkan
-                }
         case GGML_OP_SILU_BACK:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
