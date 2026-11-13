@@ -82,12 +82,8 @@ float2 rope_yarn(float theta_extrap, uint i) {
     return float2(cos(theta) * mscale, SIN_SIGN * sin(theta) * mscale);
 }
 
-[numthreads(WG_SIZE, 1, 1)]
-void main(uint3 gid : SV_DispatchThreadID) {
-    const uint t = flat_index(gid, nwg_x);
-    if (t >= n_threads) {
-        return;
-    }
+// one rotation unit t: dst element indices p0, p1 and their values
+void rope_unit(uint t, out uint p0, out float v0, out uint p1, out float v1) {
     const bool is_neox   = (mode & 2u) != 0;
     const bool is_mrope  = (mode & 8u) != 0;
     const bool is_imrope = mode == 40u;
@@ -105,8 +101,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint dst_row = offset_dst + i3 * stride_dst3 + i2 * stride_dst2 + i1 * stride_dst1;
 
     if ((i0 < n_offs || i0 >= n_offs + n_dims) && !is_vision) {
-        STORE(dst, dst_row + i0, LOAD(src0, src_row + i0));
-        STORE(dst, dst_row + i0 + 1, LOAD(src0, src_row + i0 + 1));
+        p0 = dst_row + i0;
+        v0 = LOAD(src0, src_row + i0);
+        p1 = dst_row + i0 + 1;
+        v1 = LOAD(src0, src_row + i0 + 1);
         return;
     }
 
@@ -153,6 +151,47 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
     const float x0 = LOAD(src0, src_row + pair_base);
     const float x1 = LOAD(src0, src_row + pair_base + pair_off);
-    STORE(dst, dst_row + pair_base, x0 * thetas.x - x1 * thetas.y);
-    STORE(dst, dst_row + pair_base + pair_off, x0 * thetas.y + x1 * thetas.x);
+    p0 = dst_row + pair_base;
+    v0 = x0 * thetas.x - x1 * thetas.y;
+    p1 = dst_row + pair_base + pair_off;
+    v1 = x0 * thetas.y + x1 * thetas.x;
 }
+
+#if defined(F16_WORDS)
+// exp1105: two units per thread, whole 32-bit words, no atomics (host: ne0, n_dims, n_offs % 4 == 0, dst offset/strides even)
+void store_word(uint p, float lo, float hi) {
+    dst.Store(p * 2u, f32_to_f16_rne(lo) | (f32_to_f16_rne(hi) << 16));
+}
+
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    const uint t = 2u * flat_index(gid, nwg_x);
+    if (t >= n_threads) {
+        return;
+    }
+    uint  a0, a1, b0, b1;
+    float va0, va1, vb0, vb1;
+    rope_unit(t, a0, va0, a1, va1);
+    rope_unit(t + 1u, b0, vb0, b1, vb1);
+    if (a1 == a0 + 1u) {        // normal mode or pass-through: each unit owns one word
+        store_word(a0, va0, va1);
+        store_word(b0, vb0, vb1);
+    } else {                    // neox / mrope / vision: b0 == a0 + 1, b1 == a1 + 1
+        store_word(a0, va0, vb0);
+        store_word(a1, va1, vb1);
+    }
+}
+#else
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    const uint t = flat_index(gid, nwg_x);
+    if (t >= n_threads) {
+        return;
+    }
+    uint  p0, p1;
+    float v0, v1;
+    rope_unit(t, p0, v0, p1, v1);
+    STORE(dst, p0, v0);
+    STORE(dst, p1, v1);
+}
+#endif

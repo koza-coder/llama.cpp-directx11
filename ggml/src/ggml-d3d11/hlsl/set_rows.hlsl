@@ -65,12 +65,17 @@ cbuffer Params : register(b0) {
 
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
+#if defined(F16_WORDS)
+    const uint ne0s = ne0 / 2u;   // exp1105: one thread = one 32-bit word = two f16 columns (host: ne0, offset_dst, dst strides even)
+#else
+    const uint ne0s = ne0;
+#endif
     const uint i = flat_index(gid, nwg_x);
-    if (i >= ne3 * ne2 * n_rows * ne0) {
+    if (i >= ne3 * ne2 * n_rows * ne0s) {
         return;
     }
-    uint row = i / ne0;
-    const uint col = i % ne0;
+    uint row = i / ne0s;
+    const uint col = (i % ne0s) * (ne0 / ne0s);
 
     const uint i_src3 = row / (ne2 * n_rows);
     row = row % (ne2 * n_rows);
@@ -91,5 +96,18 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint i_dst_row = offset_dst + idx_val * stride_dst1 + i_src2 * stride_dst2 + i_src3 * stride_dst3;
     const uint i_src_row = offset_src + i_src1 * stride_src1 + i_src2 * stride_src2 + i_src3 * stride_src3;
 
+#if defined(F16_WORDS)
+    dst.Store((i_dst_row + col) * 2u, f32_to_f16_rne(LOAD_SRC(i_src_row + col)) | (f32_to_f16_rne(LOAD_SRC(i_src_row + col + 1u)) << 16));
+#elif defined(F16_RMW_PASS)
+    // exp1105 part 6: only dst elements of parity F16_RMW_PASS in this dispatch -> no two threads share a word -> plain read-modify-write
+    const uint e = i_dst_row + col;
+    if ((e & 1u) == F16_RMW_PASS) {
+        const uint a  = (e * 2u) & ~3u;
+        const uint sh = (e & 1u) * 16u;
+        const uint w  = dst.Load(a);
+        dst.Store(a, (w & ~(0xFFFFu << sh)) | (f32_to_f16_rne(LOAD_SRC(i_src_row + col)) << sh));
+    }
+#else
     STORE_DST(i_dst_row + col, LOAD_SRC(i_src_row + col));
+#endif
 }

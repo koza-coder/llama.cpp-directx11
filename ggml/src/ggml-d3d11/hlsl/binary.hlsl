@@ -58,13 +58,7 @@ float op(float a, float b) {
 #endif
 }
 
-[numthreads(WG_SIZE, 1, 1)]
-void main(uint3 gid : SV_DispatchThreadID) {
-    const uint idx = flat_index(gid, nwg_x);
-    if (idx >= ne) {
-        return;
-    }
-
+float value_at(uint idx) {
     uint i = idx;
     const uint a_i3 = i / (a_ne2 * a_ne1 * a_ne0);
     i = i % (a_ne2 * a_ne1 * a_ne0);
@@ -84,5 +78,28 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
     const float a = LOAD(src0, src0_i);
     const float b = LOAD(src1, src1_i);
-    STORE(dst, offset_dst + idx, op(a, b));
+    return op(a, b);
 }
+
+#if defined(F16_WORDS)
+// exp1105: one thread = one 32-bit word = two f16 outputs, plain Store, no atomics (host: ne and offset_dst even)
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    const uint idx = 2u * flat_index(gid, nwg_x);
+    if (idx >= ne) {
+        return;
+    }
+    const float v0 = value_at(idx);
+    const float v1 = value_at(idx + 1u);
+    dst.Store((offset_dst + idx) * 2u, f32_to_f16_rne(v0) | (f32_to_f16_rne(v1) << 16));
+}
+#else
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    const uint idx = flat_index(gid, nwg_x);
+    if (idx >= ne) {
+        return;
+    }
+    STORE(dst, offset_dst + idx, value_at(idx));
+}
+#endif
