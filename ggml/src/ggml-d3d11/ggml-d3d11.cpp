@@ -205,6 +205,7 @@ struct d3d11_device_ctx {
     std::string name;   // "D3D110"
     std::string desc;   // adapter description
     uint32_t    vendor_id     = 0;
+    bool        f16_atomic_unsafe = false;   // exp1105: InterlockedAnd/Or f16 stores crash this GPU (ZX C-960)
     size_t      dedicated_mem = 0;
     size_t      shared_mem    = 0;
     size_t      max_alloc     = D3D11_DEFAULT_MAX_ALLOC;
@@ -1381,6 +1382,13 @@ static void ggml_d3d11_cpy(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tenso
     ggml_d3d11_dispatch(dev, pipeline, params, { bsrc.va, bdst.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
+// exp1105: f16 outputs as whole 32-bit words (two values per thread) instead of two atomics per value; GGML_D3D11_F16_WORDS=0 = old path
+// exp1105 part 7: default on only where f16 atomics are unsafe (ZX C-960); GGML_D3D11_F16_WORDS=1/0 forces it on/off on any GPU
+static bool ggml_d3d11_f16_words(const d3d11_device_ctx & dev) {
+    static const int env = [] { const char * e = getenv("GGML_D3D11_F16_WORDS"); return e ? (atoi(e) != 0 ? 1 : 0) : -1; }();
+    return env >= 0 ? env != 0 : dev.f16_atomic_unsafe;
+}
+
 static void ggml_d3d11_binary_op(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
     const char * op_define = nullptr;
     switch (dst->op) {
@@ -1394,12 +1402,18 @@ static void ggml_d3d11_binary_op(d3d11_device_ctx & dev, ggml_tensor * src0, ggm
     if (dst->type == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
     }
-    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "binary", hlsl_binary, defines);
-
     const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
     const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
     const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const bool words = dst->type == GGML_TYPE_F16 && ne % 2 == 0 && bd.elem_offset % 2 == 0 && ggml_d3d11_f16_words(dev);
+    if (words) {
+        defines.push_back("F16_WORDS");
+    }
+    if (dst->type == GGML_TYPE_F16 && !words && dev.f16_atomic_unsafe && ggml_d3d11_f16_words(dev)) {
+        GGML_ABORT("ggml_d3d11: %s f16 dst would use atomic f16 stores (crash risk on this GPU), offset %u", ggml_op_name(dst->op), bd.elem_offset);
+    }
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "binary", hlsl_binary, defines);
     const size_t        t0 = ggml_type_size(src0->type);
     const size_t        t1 = ggml_type_size(src1->type);
 
@@ -1410,7 +1424,7 @@ static void ggml_d3d11_binary_op(d3d11_device_ctx & dev, ggml_tensor * src0, ggm
         (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2],
         (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], (uint32_t) src1->ne[2], (uint32_t) src1->ne[3],
     };
-    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(words ? ne / 2 : ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 static void ggml_d3d11_scale(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
@@ -1504,8 +1518,6 @@ static void ggml_d3d11_set_rows(d3d11_device_ctx & dev, ggml_tensor * src, ggml_
     if (idx->type == GGML_TYPE_I64) {
         defines.push_back("I64_IDX");
     }
-    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "set_rows", hlsl_set_rows, defines);
-
     const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
     const d3d11_binding bi = ggml_d3d11_bind_tensor(idx);
     const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
@@ -1513,6 +1525,19 @@ static void ggml_d3d11_set_rows(d3d11_device_ctx & dev, ggml_tensor * src, ggml_
     const size_t        ti = ggml_type_size(idx->type);
     const size_t        td = ggml_type_size(dst->type);
     const uint32_t      ne = (uint32_t) ggml_nelements(src);
+    const bool words = dst->type == GGML_TYPE_F16 && src->ne[0] % 2 == 0 && bd.elem_offset % 2 == 0 &&
+                       (dst->nb[1] / td) % 2 == 0 && (dst->nb[2] / td) % 2 == 0 && (dst->nb[3] / td) % 2 == 0 && ggml_d3d11_f16_words(dev);
+    if (words) {
+        defines.push_back("F16_WORDS");
+    }
+    // exp1105 part 6: no word path (e.g. the transposed V cache, ne0 = 1) on a GPU where f16 atomics crash -> two parity passes
+    const bool rmw = dst->type == GGML_TYPE_F16 && !words && dev.f16_atomic_unsafe && ggml_d3d11_f16_words(dev);
+    std::vector<std::string> defines1 = defines;
+    if (rmw) {
+        defines.push_back("F16_RMW_PASS=0");
+        defines1.push_back("F16_RMW_PASS=1");
+    }
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "set_rows", hlsl_set_rows, defines);
 
     std::vector<uint32_t> params = {
         bs.elem_offset, bi.elem_offset, bd.elem_offset,
@@ -1522,7 +1547,11 @@ static void ggml_d3d11_set_rows(d3d11_device_ctx & dev, ggml_tensor * src, ggml_
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
         (uint32_t) idx->ne[1], (uint32_t) idx->ne[2],
     };
-    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(words ? ne / 2 : ne, (uint32_t) D3D11_WG_SIZE));
+    if (rmw) {
+        d3d11_pipeline & pipeline1 = ggml_d3d11_get_pipeline(dev, "set_rows", hlsl_set_rows, defines1);
+        ggml_d3d11_dispatch(dev, pipeline1, params, { bs.va, bi.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
+    }
 }
 
 static bool ggml_d3d11_mul_mat_vec_type(ggml_type t) {
@@ -3887,9 +3916,6 @@ static void ggml_d3d11_rope(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_ten
     if (backward) {
         defines.push_back("BACKWARD");
     }
-    d3d11_pipeline & pipeline =
-        ggml_d3d11_get_pipeline(dev, backward ? "rope_back" : "rope", hlsl_rope, defines);
-
     const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
     const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
     const d3d11_binding b2 = src2 ? ggml_d3d11_bind_tensor(src2) : d3d11_binding{ 0, 0 };
@@ -3900,6 +3926,20 @@ static void ggml_d3d11_rope(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_ten
     const int mode       = ((int32_t *) dst->op_params)[2];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
     const int n_offs     = ((int32_t *) dst->op_params)[15];
+    // exp1105: f16 dst as whole words, two rotation units per thread (see rope.hlsl)
+    // exp1105 part 4: vision pairs are (p, p + n_dims), so an even n_dims keeps both words aligned; neox/mrope use n_dims / 2
+    const bool words = dst->type == GGML_TYPE_F16 && src0->ne[0] % 4 == 0 && n_offs % 4 == 0 &&
+                       (mode == GGML_ROPE_TYPE_VISION ? n_dims % 2 == 0 : n_dims % 4 == 0) &&
+                       bd.elem_offset % 2 == 0 && (dst->nb[1] / ts) % 2 == 0 && (dst->nb[2] / ts) % 2 == 0 &&
+                       (dst->nb[3] / ts) % 2 == 0 && ggml_d3d11_f16_words(dev);
+    if (words) {
+        defines.push_back("F16_WORDS");
+    }
+    if (dst->type == GGML_TYPE_F16 && !words && dev.f16_atomic_unsafe && ggml_d3d11_f16_words(dev)) {
+        GGML_ABORT("ggml_d3d11: %s f16 dst would use atomic f16 stores (crash risk on this GPU), offset %u", ggml_op_name(dst->op), bd.elem_offset);
+    }
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, backward ? "rope_back" : "rope", hlsl_rope, defines);
     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
     memcpy(&freq_base,   (int32_t *) dst->op_params + 5,  sizeof(float));
     memcpy(&freq_scale,  (int32_t *) dst->op_params + 6,  sizeof(float));
@@ -3926,7 +3966,7 @@ static void ggml_d3d11_rope(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_ten
         (uint32_t) sections[0], (uint32_t) sections[1], (uint32_t) sections[2], (uint32_t) sections[3],
         (uint32_t) n_offs,
     };
-    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va }, CEIL_DIV(n_threads, (uint32_t) D3D11_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va }, CEIL_DIV(words ? n_threads / 2 : n_threads, (uint32_t) D3D11_WG_SIZE));
 }
 
 static void ggml_d3d11_glu(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
@@ -4999,9 +5039,43 @@ static bool ggml_backend_d3d11_device_supports_buft(ggml_backend_dev_t dev, ggml
     return buft->iface.get_name == ggml_backend_d3d11_buffer_type_get_name && buft->device == dev;
 }
 
+// exp1105: true when an op with an f16 dst will take a whole-word (no atomics) store path
+static bool ggml_d3d11_f16_word_ok(const ggml_tensor * op) {
+    const size_t h = sizeof(uint16_t);
+    const bool   strides_even = (op->nb[1] / h) % 2 == 0 && (op->nb[2] / h) % 2 == 0 && (op->nb[3] / h) % 2 == 0;
+    if (op->op != GGML_OP_SET_ROWS && op->view_src != nullptr && (op->view_offs / h) % 2 != 0) {
+        return false;
+    }
+    switch (op->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            return ggml_nelements(op) % 2 == 0;
+        case GGML_OP_SET_ROWS:
+            return true;   // part 6: word path or two parity passes
+        case GGML_OP_ROPE: {
+            const int n_dims = ((const int32_t *) op->op_params)[1];
+            const int mode   = ((const int32_t *) op->op_params)[2];
+            const int n_offs = ((const int32_t *) op->op_params)[15];
+            return op->src[0]->ne[0] % 4 == 0 && n_offs % 4 == 0 &&
+                   (mode == GGML_ROPE_TYPE_VISION ? n_dims % 2 == 0 : n_dims % 4 == 0) && strides_even;
+        }
+        default:
+            return false;
+    }
+}
+
 static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
+
+    // exp1105: on a GPU where atomic f16 stores crash the box, every f16 result must be written as whole words
+    if (ctx->f16_atomic_unsafe && op->type == GGML_TYPE_F16 && ggml_d3d11_f16_words(*ctx) && op->op != GGML_OP_NONE &&
+        op->op != GGML_OP_VIEW && op->op != GGML_OP_RESHAPE && op->op != GGML_OP_PERMUTE &&
+        op->op != GGML_OP_TRANSPOSE && !ggml_d3d11_f16_word_ok(op)) {
+        return false;
+    }
 
     if (!ctx->disable_ops.empty() && op->op != GGML_OP_NONE && op->op != GGML_OP_VIEW &&
         op->op != GGML_OP_RESHAPE && op->op != GGML_OP_PERMUTE && op->op != GGML_OP_TRANSPOSE) {
@@ -5629,6 +5703,9 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
         dev.fa_work       = std::max<uint64_t>(1, strtoull(env, nullptr, 10));
         dev.fa_work_fixed = true;
     }
+    if (dev.vendor_id == 0x1d17) {
+        dev.mm_tpr_max = 1;   // exp1105 r12: ZX C-960 mat-vec 1.9-5.7x faster with one thread per row (no groupshared reduction)
+    }
     if (const char * env = getenv("GGML_D3D11_MM_TPR")) {
         dev.mm_tpr_max = (uint32_t) std::max(1, atoi(env));
     }
@@ -5815,6 +5892,10 @@ static void ggml_d3d11_enumerate(ggml_backend_d3d11_reg_context & reg_ctx, ggml_
         dev->adapter       = adapter;
         dev->desc          = ggml_d3d11_wide_to_utf8(desc.Description);
         dev->vendor_id     = desc.VendorId;
+        {
+            const char * e = getenv("GGML_D3D11_F16_ATOMIC_UNSAFE");
+            dev->f16_atomic_unsafe = e ? atoi(e) != 0 : desc.VendorId == 0x1d17;   // 0x1d17 = Zhaoxin (exp1100)
+        }
         dev->dedicated_mem = desc.DedicatedVideoMemory;
         dev->shared_mem    = desc.SharedSystemMemory;
         dev->name          = GGML_D3D11_NAME + std::to_string(reg_ctx.devs.size());
