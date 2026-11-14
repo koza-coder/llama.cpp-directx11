@@ -167,6 +167,27 @@ void dot_row(RWByteAddressBuffer wbuf, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_Q4_1) && defined(ONE_COL) && defined(SRC1_LDS) && !defined(SRC1_F16)
+    // exp1105 part 13: single column with src1 in groupshared; the 20-byte block is 4-byte aligned: Load4 (d|m, nibbles 0-3) + Load (nibbles 4)
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 20;
+        const uint4 w03  = wbuf.Load4(base);
+        const uint  Q[4] = { w03.y, w03.z, w03.w, wbuf.Load(base + 16) };
+        const uint  ys   = (src1_base[0] + blk * 32) * 4;
+        float       sum  = 0.0f;
+        float       ysum = 0.0f;
+        [unroll] for (uint j = 0; j < 4; j++) {
+            const uint   q   = Q[j];
+            const float4 ylo = asfloat(SRC1_LOAD4(ys + 16 * j));
+            const float4 yhi = asfloat(SRC1_LOAD4(ys + 64 + 16 * j));
+            sum  += (float) ( q        & 0xFu) * ylo.x + (float) ((q >>  8) & 0xFu) * ylo.y +
+                    (float) ((q >> 16) & 0xFu) * ylo.z + (float) ((q >> 24) & 0xFu) * ylo.w +
+                    (float) ((q >>  4) & 0xFu) * yhi.x + (float) ((q >> 12) & 0xFu) * yhi.y +
+                    (float) ((q >> 20) & 0xFu) * yhi.z + (float) ( q >> 28        ) * yhi.w;
+            ysum += ylo.x + ylo.y + ylo.z + ylo.w + yhi.x + yhi.y + yhi.z + yhi.w;
+        }
+        acc[0] += sum * f16tof32(w03.x & 0xFFFFu) + ysum * f16tof32(w03.x >> 16);
+    }
 #elif defined(SRC0_Q4_1)
     // block: f16 d, f16 m, 16 bytes of nibbles; value = q * d + m
     for (uint blk = lane; blk < k / 32; blk += TPR) {
