@@ -1884,6 +1884,22 @@ static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1,
     if (multi_col) {
         defines.push_back("MULTI_COL");
     }
+    // exp1105 part 8: src1 column in groupshared for one-thread-per-row single-column Q4_0/Q8_0 products (default: Zhaoxin 0x1d17)
+    {
+        static const int lds_env = [] { const char * e = getenv("GGML_D3D11_MV_LDS"); return e ? (atoi(e) != 0 ? 1 : 0) : -1; }();
+        const bool lds_on = lds_env >= 0 ? lds_env != 0 : dev.vendor_id == 0x1d17;
+        if (lds_on && one_col && !multi_col && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_1) &&
+            src1->type == GGML_TYPE_F32 && src0->ne[0] % 32 == 0 && src0->ne[0] <= 4096) {
+            const int64_t lds_k = src0->ne[0] <= 1024 ? 1024 : src0->ne[0] <= 2048 ? 2048 : 4096;   // part 9: few variants (FXC is slow on the C-960 host)
+            defines.push_back("SRC1_LDS=" + std::to_string(lds_k));
+            // exp1105 part 11: 2 threads per row with src1 in groupshared (ZX C-960 r25: +31 % tg over 1); defines[1] is the TPR define
+            static const bool tpr_env = getenv("GGML_D3D11_MM_TPR") != nullptr;
+            if (dev.vendor_id == 0x1d17 && !tpr_env && tpr == 1 && units >= 2) {
+                tpr        = 2;
+                defines[1] = "TPR=2";
+            }
+        }
+    }
     // On the AMD Vega iGPU every N_MATS=2 kernel without FUSE_ADD hung the GPU (DEVICE_HUNG, 2026-09-19); taking
     // the FUSE_ADD variant for groups (add_flag 0 skips the add at run time) avoids it. Why the variant matters is
     // not known. It is not free - about 7% of tg128 on an Intel Iris Xe - so it is limited to AMD integrated GPUs;

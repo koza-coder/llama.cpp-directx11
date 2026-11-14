@@ -83,6 +83,15 @@ cbuffer Params : register(b0) {
 groupshared float partial[MAX_COLS][WG_SIZE];
 #endif
 
+// exp1105 part 8: SRC1_LDS = k; the single src1 column of the workgroup in groupshared, loaded once (TPR = 1 rows read it k times)
+#if defined(SRC1_LDS)
+groupshared float4 src1_lds[(SRC1_LDS + 3) / 4];
+static uint src1_lds_base;
+#define SRC1_LOAD4(a) asuint(src1_lds[((a) - src1_lds_base) >> 4])
+#else
+#define SRC1_LOAD4(a) src1.Load4(a)
+#endif
+
 // src1 columns are f32 unless SRC1_F16 is set (the vision tower multiplies two f16 tensors)
 #if defined(SRC1_F16)
 float load_src1(uint i) {
@@ -174,6 +183,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     [unroll] for (uint c = 0; c < MAX_COLS; c++) {
         src1_base[c] = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12 + (col0 + c) * stride_11;
     }
+#if defined(SRC1_LDS)
+    // the column is the same for every row of this workgroup (batch is uniform); the early return above is uniform too
+    src1_lds_base = src1_base[0] * 4;
+    for (uint li = tid; li < k / 4; li += WG_SIZE) {
+        src1_lds[li] = asfloat(src1.Load4(src1_lds_base + li * 16));
+    }
+    GroupMemoryBarrierWithGroupSync();
+#endif
 #endif
     float acc[MAX_COLS] = { 0, 0, 0, 0 };
 
