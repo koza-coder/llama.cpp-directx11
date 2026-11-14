@@ -2595,20 +2595,6 @@ static void ggml_d3d11_arange(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_d3d11_dispatch(dev, pipeline, params, { bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-// DIAG_MASK_INF / DIAG_MASK_ZERO: copy src and replace everything right of the shifted diagonal
-static void ggml_d3d11_diag_mask(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, float value) {
-    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "diag_mask", hlsl_diag_mask, {});
-    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
-    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
-    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
-    const std::vector<uint32_t> params = {
-        bs.elem_offset, bd.elem_offset, ne,
-        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
-        (uint32_t) ggml_get_op_params_i32(dst, 0), ggml_d3d11_u32_from_f32(value),
-    };
-    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
-}
-
 // ROLL: cyclic shift along all four axes, one workgroup per destination row
 static void ggml_d3d11_roll(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "roll", hlsl_roll, {});
@@ -2760,23 +2746,6 @@ static void ggml_d3d11_count_equal(d3d11_device_ctx & dev, ggml_tensor * src0, g
         (uint32_t) ggml_nrows(src0),
     };
     ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
-}
-
-// ADD1: dst = src0 plus a scalar that lives in device memory
-static void ggml_d3d11_add1(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
-                            ggml_tensor * dst) {
-    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "add1", hlsl_add1, {});
-    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
-    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
-    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
-    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
-    const std::vector<uint32_t> params = {
-        b0.elem_offset, b1.elem_offset, bd.elem_offset,
-        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
-        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
-        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
-    };
-    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, n_rows);
 }
 
 // LEAKY_RELU: negative inputs scaled by the slope in op_params
@@ -4235,12 +4204,6 @@ static void ggml_d3d11_encode_node(d3d11_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_ARANGE:
             ggml_d3d11_arange(dev, node);
             return;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_d3d11_diag_mask(dev, node->src[0], node, -INFINITY);
-            return;
-        case GGML_OP_DIAG_MASK_ZERO:
-            ggml_d3d11_diag_mask(dev, node->src[0], node, 0.0f);
-            return;
         case GGML_OP_ROLL:
             ggml_d3d11_roll(dev, node->src[0], node);
             return;
@@ -4267,9 +4230,6 @@ static void ggml_d3d11_encode_node(d3d11_device_ctx & dev, ggml_tensor * node) {
             return;
         case GGML_OP_COUNT_EQUAL:
             ggml_d3d11_count_equal(dev, node->src[0], node->src[1], node);
-            return;
-        case GGML_OP_ADD1:
-            ggml_d3d11_add1(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_LEAKY_RELU:
             ggml_d3d11_leaky_relu(dev, node->src[0], node);
@@ -5206,12 +5166,6 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
                    ggml_is_contiguous_rows(src0) && ggml_is_contiguous(op);
         case GGML_OP_ARANGE:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_nelements(op) <= UINT32_MAX;
-        case GGML_OP_DIAG_MASK_INF:
-        case GGML_OP_DIAG_MASK_ZERO:
-            // the flat index assumes both sides are contiguous, which is what the CPU asserts too
-            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
-                   ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_ROLL:
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
@@ -5277,10 +5231,6 @@ static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * o
                    op->type == GGML_TYPE_I64 && ggml_is_scalar(op) &&
                    ggml_are_same_shape(src0, src1) && ggml_is_contiguous_rows(src0) &&
                    ggml_is_contiguous_rows(src1) && ggml_nelements(src0) <= UINT32_MAX;
-        case GGML_OP_ADD1:
-            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32 && ggml_is_scalar(src1) &&
-                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
         case GGML_OP_LEAKY_RELU:
             return src0->type == op->type &&
                    (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
