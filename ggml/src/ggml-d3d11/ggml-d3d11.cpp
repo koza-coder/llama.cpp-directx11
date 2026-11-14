@@ -1888,7 +1888,7 @@ static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1,
     {
         static const int lds_env = [] { const char * e = getenv("GGML_D3D11_MV_LDS"); return e ? (atoi(e) != 0 ? 1 : 0) : -1; }();
         const bool lds_on = lds_env >= 0 ? lds_env != 0 : dev.vendor_id == 0x1d17;
-        if (lds_on && one_col && !multi_col && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
+        if (lds_on && one_col && !multi_col && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_1) &&
             src1->type == GGML_TYPE_F32 && src0->ne[0] % 32 == 0 && src0->ne[0] <= 4096) {
             const int64_t lds_k = src0->ne[0] <= 1024 ? 1024 : src0->ne[0] <= 2048 ? 2048 : 4096;   // part 9: few variants (FXC is slow on the C-960 host)
             defines.push_back("SRC1_LDS=" + std::to_string(lds_k));
