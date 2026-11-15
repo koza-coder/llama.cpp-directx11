@@ -5582,7 +5582,22 @@ static bool ggml_backend_d3d11_device_supports_op(ggml_backend_dev_t dev, const 
         const ggml_tensor * t = op->src[i]->view_src ? op->src[i]->view_src : op->src[i];
         too_big = too_big || ggml_nbytes(t) > D3D11_MAX_BUFFER_BYTES + 256;
     }
-    const bool ok  = !amd_fa && !too_big && ggml_d3d11_supports_op(ctx, op);
+    // exp1151: Zhaoxin ZX C-960 (0x1d17): packed types (bf16, f8, quantized) gave NaN / wrong values or crashed in CPY, CONT,
+    // GET_ROWS, ADD (exp1147/exp1149/exp1150); only f32/f16/i32/i64 tensors stay on the GPU, plus MUL_MAT weights that passed (exp1150).
+    // GGML_D3D11_ZX_MASK=0 turns it off.
+    static const bool zx_mask_env = [] { const char * e = getenv("GGML_D3D11_ZX_MASK"); return !e || atoi(e) != 0; }();
+    bool zx_bad = false;
+    if (ctx->vendor_id == 0x1d17 && zx_mask_env && op->op != GGML_OP_NONE && op->op != GGML_OP_VIEW && op->op != GGML_OP_RESHAPE &&
+        op->op != GGML_OP_PERMUTE && op->op != GGML_OP_TRANSPOSE) {
+        auto plain = [](ggml_type t) { return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_I32 || t == GGML_TYPE_I64; };   // I64 = SET_ROWS index (KV cache)
+        auto mm_ok = [](ggml_type t) { return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_BF16; };
+        const bool is_mm = op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID;
+        zx_bad = !plain(op->type);
+        for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
+            zx_bad = zx_bad || !(plain(op->src[i]->type) || (i == 0 && is_mm && mm_ok(op->src[i]->type)));
+        }
+    }
+    const bool ok  = !amd_fa && !too_big && !zx_bad && ggml_d3d11_supports_op(ctx, op);
     if (!ok && ctx->stats) {
         std::string key = ggml_op_desc(op);
         for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
@@ -5705,6 +5720,9 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
         for (char & c : dev.disable_ops) {
             if (c == '.') { c = ','; }
         }
+    } else if (dev.vendor_id == 0x1d17) {
+        // exp1148: Zhaoxin ZX C-960 soft_max hangs or returns wrong values (exp1144/exp1145); run it on the CPU
+        dev.disable_ops = ",SOFT_MAX,";
     }
 
     if (getenv("GGML_D3D11_DEBUG") != nullptr) {
