@@ -1762,9 +1762,16 @@ static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0,
     if (dst_ld != 0) {
         defines.push_back("DST_S1");
     }
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    // exp1173 (port of DX12 exp1172): F16 weights whose rows all start 4-byte aligned are staged with one Load4 per 8 values instead
+    // of 8 unaligned dword loads (offset and every stride an even number of halves)
+    static const bool no_f16_al = getenv("GGML_D3D11_NO_F16_AL") != nullptr;
+    if (src0->type == GGML_TYPE_F16 && !no_f16_al && b0.elem_offset % 2 == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 &&
+        src0->nb[3] % 4 == 0) {
+        defines.push_back("F16_AL");
+    }
     d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
 
-    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
     const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
     const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        t0 = ggml_type_size(src0->type);
