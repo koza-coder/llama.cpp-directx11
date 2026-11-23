@@ -53,9 +53,11 @@
 #ifndef GGML_D3D11_TILE_M
 #define GGML_D3D11_TILE_M           128   // v0.3.0: 128 rows per tiled workgroup (exp353 and later all measured with 128); env-free, per-type override: Q6_K 64
 #endif
-// Q6_K runs faster with 64 rows per workgroup (exp327 vs exp338: 47.5 vs 48.4 t/s pp512 on Intel), every other type with GGML_D3D11_TILE_M
+// Q6_K runs faster with 64 rows per workgroup (exp327 vs exp338: 47.5 vs 48.4 t/s pp512 on Intel), every other type with GGML_D3D11_TILE_M.
+// exp1200: F32 weights also take 64 rows (exp1196, ZX C-960: the 128-row F32 tile is 97 % of octo's GPU time, ~400 ms per dispatch;
+// D3D12 keeps F32 on 64 rows since exp1170 for the Iris Xe).
 static uint32_t ggml_d3d11_tile_m(ggml_type t) {
-    return t == GGML_TYPE_Q6_K ? 64u : (uint32_t) GGML_D3D11_TILE_M;
+    return (t == GGML_TYPE_Q6_K || t == GGML_TYPE_F32) ? 64u : (uint32_t) GGML_D3D11_TILE_M;
 }
 #ifndef GGML_D3D11_TILED_MMID_DEFAULT
 #define GGML_D3D11_TILED_MMID_DEFAULT 16   // exp358: MUL_MAT_ID tiled gate (tokens), separate from the dense MUL_MAT gate; env GGML_D3D11_TILED_MMID
