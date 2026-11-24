@@ -3855,6 +3855,16 @@ static void ggml_d3d11_gated_delta_net(d3d11_device_ctx & dev, ggml_tensor * dst
     if (g->ne[0] == S_v) {
         defines.push_back("KDA");
     }
+    // LANES threads per state row (one thread per row leaves the GPU idle: Qwen3.5-9B has 32 x 128 rows per sequence);
+    // GGML_D3D11_GDN_LANES=1 = one thread per row
+    static const char * lanes_env = getenv("GGML_D3D11_GDN_LANES");
+    uint32_t lanes = lanes_env ? (uint32_t) std::max(1, atoi(lanes_env)) : 8u;
+    while (lanes > 1 && ((lanes & (lanes - 1)) != 0 || S_v % (4 * lanes) != 0 || D3D11_WG_SIZE % lanes != 0)) {
+        lanes /= 2;
+    }
+    if (lanes > 1) {
+        defines.push_back("LANES=" + std::to_string(lanes));
+    }
     d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "gated_delta_net", hlsl_gated_delta_net, defines);
 
     const d3d11_binding bq = ggml_d3d11_bind_tensor(q);
@@ -3896,7 +3906,7 @@ static void ggml_d3d11_gated_delta_net(d3d11_device_ctx & dev, ggml_tensor * dst
             ggml_d3d11_begin(dev, true);
         }
         ggml_d3d11_dispatch(dev, pipeline, params, { bq.va, bk.va, bv.va, bg.va, bb.va, bs.va, bd.va },
-                            CEIL_DIV(n_rows, (uint32_t) D3D11_WG_SIZE));
+                            CEIL_DIV(n_rows * lanes, (uint32_t) D3D11_WG_SIZE));
     }
 }
 
